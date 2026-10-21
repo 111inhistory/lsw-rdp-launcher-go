@@ -339,8 +339,15 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 		return
 	}
 	if out.Err != nil {
-		if op.Kind == QueryVM && op.revision != m.revision {
-			return
+		if op.Kind == QueryVM {
+			// Fail queued callers consistently whether source loss or this
+			// result arrived first. Revision only guards observation state.
+			for len(m.queue) > 0 {
+				m.finish(m.queue[0], Result{Err: out.Err})
+			}
+			if op.revision != m.revision {
+				return
+			}
 		}
 		preparing := m.memory.phase != memoryIdle
 		if preparing {
@@ -354,9 +361,6 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 		// Wait for its replacement subscription ACK, not another CLI request.
 		if op.Kind == QueryVM {
 			m.needQuery = false
-			for len(m.queue) > 0 {
-				m.finish(m.queue[0], Result{Err: out.Err})
-			}
 		} else if op.job != nil {
 			m.finish(op.job, Result{Err: out.Err})
 		} else if preparing {
