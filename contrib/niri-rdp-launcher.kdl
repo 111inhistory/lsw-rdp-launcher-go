@@ -3,7 +3,7 @@
 window-rule {
     match app-id="^rdp-launcher-dialog$"
     open-floating true
-    geometry-corner-radius 16
+    // Inherit the desktop/DMS corner radius instead of overriding it.
     clip-to-geometry true
     // Otherwise the focus ring's opaque fill can cover the wallpaper effect.
     draw-border-with-background false

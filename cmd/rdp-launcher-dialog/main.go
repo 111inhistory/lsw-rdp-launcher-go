@@ -17,6 +17,7 @@ type dialog struct {
 	decision controller.SwitchDecision
 	done     bool
 	opaque   bool // Accessibility preference: do not draw translucent surfaces.
+	style    *dmsStyle
 	close    func()
 }
 
@@ -35,6 +36,13 @@ func count(value *uint32) string {
 	}
 	return fmt.Sprint(*value)
 }
+func (d *dialog) scale() float32 {
+	if d.style != nil {
+		return d.style.fontScale
+	}
+	return 1
+}
+
 func (d *dialog) view(c *ui.Context) {
 	if c.Shortcut(0, ui.KeyEscape) {
 		d.choose(controller.SwitchCancel)
@@ -48,8 +56,13 @@ func (d *dialog) view(c *ui.Context) {
 	theme.Border = theme.Surface
 	theme.Radius = 18
 	background := theme.Background.Mix(theme.Accent, 0.04)
+	alpha := uint8(214)
+	if d.style != nil {
+		d.style.apply(&theme)
+		background, alpha = theme.Background, d.style.alpha
+	}
 	if !d.opaque {
-		background.A = 214 // Only the panel is translucent; text/controls stay opaque.
+		background.A = alpha // Only the panel is translucent; text/controls stay opaque.
 		theme.Background = ui.Transparent
 	}
 	c.SetTheme(&theme)
@@ -58,8 +71,12 @@ func (d *dialog) view(c *ui.Context) {
 		target = "完整桌面"
 	}
 	a := d.prompt.Activity
-	ui.Column(c).Fill().Padding(24).Gap(12).Background(background).Children(func() {
-		ui.Text(c, "切换到"+target+"？").FontSize(20).Bold()
+	scale, weight := d.scale(), 400
+	if d.style != nil {
+		weight = d.style.fontWeight
+	}
+	ui.Column(c).Fill().Padding(24 * scale).Gap(12 * scale).Radius(theme.Radius).Background(background).FontWeight(weight).Children(func() {
+		ui.Text(c, "切换到"+target+"？").FontSize(20 * scale).FontWeight(min(weight+100, 900))
 		if a.CanLogoff() {
 			ui.Text(c, "窗口 "+count(a.Windows)+" · 托盘 "+count(a.TrayIcons)).TextColor(theme.TextMuted)
 		} else {
@@ -67,14 +84,14 @@ func (d *dialog) view(c *ui.Context) {
 		}
 		ui.Text(c, "注销将关闭所有应用，未保存的内容会丢失。").TextColor(theme.TextMuted)
 		ui.Box(c).Fill()
-		ui.Row(c).Gap(12).Justify(ui.End).Children(func() {
-			if ui.Button(c.Key("cancel"), "取消").AutoFocus().Clicked() {
+		ui.Row(c).Gap(12 * scale).Justify(ui.End).Children(func() {
+			if ui.Button(c.Key("cancel"), "取消").Height(40*scale).Padding(0, 16*scale).FontWeight(500).AutoFocus().Clicked() {
 				d.choose(controller.SwitchCancel)
 			}
-			if ui.Button(c.Key("logoff"), "注销并切换").Disabled(!a.CanLogoff()).TextColor(theme.Danger).Clicked() {
+			if ui.Button(c.Key("logoff"), "注销并切换").Height(40*scale).Padding(0, 16*scale).FontWeight(500).Disabled(!a.CanLogoff()).TextColor(theme.Danger).Clicked() {
 				d.choose(controller.SwitchLogoff)
 			}
-			if ui.PrimaryButton(c.Key("keep"), "保留并切换").Clicked() {
+			if ui.PrimaryButton(c.Key("keep"), "保留并切换").Height(40*scale).Padding(0, 16*scale).FontWeight(500).Clicked() {
 				d.choose(controller.SwitchKeep)
 			}
 		})
@@ -95,7 +112,15 @@ func main() {
 	mygo.App.WhenReady(func() {
 		prefs := mygo.Theme.Preferences()
 		d.opaque = prefs.ReduceTransparency || prefs.HighContrast
-		window := mygo.NewWindow(mygo.WindowOptions{Title: "切换 Windows 连接模式", Width: 480, Height: 220, MinWidth: 480, MinHeight: 220, DisableResize: true, Transparent: true, Content: ui.View(d.view)})
+		if !prefs.HighContrast {
+			configDir, _ := os.UserConfigDir()
+			cacheDir, _ := os.UserCacheDir()
+			if configDir != "" && cacheDir != "" {
+				d.style = loadDMSStyle(configDir, cacheDir)
+			}
+		}
+		width, height := int(480*d.scale()), int(220*d.scale())
+		window := mygo.NewWindow(mygo.WindowOptions{Title: "切换 Windows 连接模式", Width: width, Height: height, MinWidth: width, MinHeight: height, DisableResize: true, Transparent: true, Content: ui.View(d.view)})
 		d.close = window.Close
 		window.OnClosed(func() {
 			if !d.done {

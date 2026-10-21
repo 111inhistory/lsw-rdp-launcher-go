@@ -92,7 +92,7 @@ func TestPanelTransparencyKeepsControlsOpaque(t *testing.T) {
 		if opaque {
 			wantAlpha = 255
 		}
-		if alpha := image.RGBAAt(4, 4).A; alpha != wantAlpha {
+		if alpha := image.RGBAAt(8, 110).A; alpha != wantAlpha {
 			t.Fatalf("opaque=%t: panel alpha=%d, want %d", opaque, alpha, wantAlpha)
 		}
 		button, ok := tt.Find("保留并切换")
