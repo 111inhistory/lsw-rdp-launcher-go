@@ -33,16 +33,23 @@ func restoreLiveMemorySession(t *testing.T, s *Session, stopped <-chan error, ol
 			return
 		}
 	}
-	if err := s.memory.restoreMemoryTarget(ctx, old.RequestedBytes); err != nil {
-		t.Error("restore old requested", err)
-		return
-	}
 	if state.VM == controller.VMPaused {
 		out := s.vm.Execute(ctx, controller.Operation{Kind: controller.WakeVM, VM: controller.VMPaused})
 		if out.Err != nil {
 			t.Error("resume cleanup", out.Err)
 			return
 		}
+		confirmed := s.vm.Execute(ctx, controller.Operation{Kind: controller.QueryVM})
+		if confirmed.Err != nil || confirmed.VM != controller.VMRunning {
+			t.Error("resume not confirmed; retaining safe target", confirmed)
+			return
+		}
+	}
+	// Keep the prepared target >= actual through resume. The original target
+	// can be below actual after partial reclaim; restore it only while running.
+	if err := s.memory.restoreMemoryTarget(ctx, old.RequestedBytes); err != nil {
+		t.Error("restore old requested", err)
+		return
 	}
 	final := s.vm.Execute(ctx, controller.Operation{Kind: controller.QueryVM})
 	device := s.memory.Execute(ctx, controller.Operation{Kind: controller.QueryMemory})

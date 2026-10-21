@@ -10,8 +10,8 @@ import (
 )
 
 // Explicit opt-in: a brief reversible VM pause. The capacity request is never
-// exposed to running vCPUs; verify plugged bytes do not increase, restore the
-// original requested target, then resume. Does not touch inactive XML or driver.
+// exposed to running vCPUs; verify plugged bytes do not increase, resume with a
+// safe target, then restore the original target. No inactive XML/driver changes.
 func TestLiveMemoryPausedWindowPreparation(t *testing.T) {
 	if os.Getenv("RDP_LIVE_MEMORY") != "1" {
 		t.Skip("set RDP_LIVE_MEMORY=1 for paused window preparation")
@@ -30,8 +30,12 @@ func TestLiveMemoryPausedWindowPreparation(t *testing.T) {
 	stopped := make(chan error, 1)
 	go func() {
 		stopped <- vm.Watch(ctx, func(ctx context.Context, e controller.Event) error {
+			state, ok := e.(controller.VMObserved)
+			if !ok {
+				return nil // Subscription readiness is not a VM transition.
+			}
 			select {
-			case states <- e.(controller.VMObserved).State:
+			case states <- state.State:
 				return nil
 			case <-ctx.Done():
 				return ctx.Err()
@@ -65,29 +69,40 @@ func TestLiveMemoryPausedWindowPreparation(t *testing.T) {
 	defer func() {
 		cleanup, stop := context.WithTimeout(context.Background(), 15*time.Second)
 		defer stop()
-		if err := memory.restoreMemoryTarget(cleanup, old.RequestedBytes); err != nil {
-			t.Error("restore requested target before resume", err)
-			return
-		}
 		state := vm.Execute(cleanup, controller.Operation{Kind: controller.QueryVM})
 		if state.Err != nil {
 			t.Error(state.Err)
 			return
 		}
 		if state.VM == controller.VMPaused {
+			// Cleanup can run before the main preparation completed. Never
+			// resume with a partially reclaimed target below actual.
+			prepared := memory.Execute(cleanup, controller.Operation{Kind: controller.PrepareMemory})
+			if prepared.Err != nil || !prepared.ResumeSafe {
+				t.Error("cleanup safe resume preparation", prepared)
+				return
+			}
 			out := vm.Execute(cleanup, controller.Operation{Kind: controller.WakeVM, VM: controller.VMPaused})
 			if out.Err != nil {
 				t.Error("resume cleanup", out.Err)
 				return
 			}
-			select {
-			case state := <-states:
-				if state != controller.VMRunning {
-					t.Error("resume confirmation", state)
+		confirmResume:
+			for {
+				select {
+				case state := <-states:
+					if state == controller.VMRunning {
+						break confirmResume
+					}
+				case <-cleanup.Done():
+					t.Error("resume not confirmed; retaining safe target", cleanup.Err())
+					return
 				}
-			case <-cleanup.Done():
-				t.Error(cleanup.Err())
 			}
+		}
+		if err := memory.restoreMemoryTarget(cleanup, old.RequestedBytes); err != nil {
+			t.Error("restore requested target after resume", err)
+			return
 		}
 		final := vm.Execute(cleanup, controller.Operation{Kind: controller.QueryVM})
 		if final.Err != nil || final.VM != controller.VMRunning {

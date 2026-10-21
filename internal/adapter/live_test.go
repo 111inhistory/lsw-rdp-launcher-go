@@ -10,6 +10,19 @@ import (
 	"github.com/111inhistory/lsw-rdp-launcher-go/internal/controller"
 )
 
+// RDP_LIVE_TOKEN_FILE points to a private local copy of the temporary Windows
+// test token. The value never enters test argv or logs.
+func liveAgent(endpoint string) Agent {
+	agent := Agent{Endpoint: endpoint}
+	if path := os.Getenv("RDP_LIVE_TOKEN_FILE"); path != "" {
+		agent.AuthToken = func(context.Context) (string, error) {
+			data, err := os.ReadFile(path)
+			return string(data), err
+		}
+	}
+	return agent
+}
+
 // Opt-in: SSH stays unchanged for 32 seconds, then changes on the same
 // subscription. Memory changes may still arrive; they are not heartbeats.
 func TestLiveBackgroundWatchQuiet(t *testing.T) {
@@ -23,7 +36,7 @@ func TestLiveBackgroundWatchQuiet(t *testing.T) {
 	stopped := make(chan error, 1)
 	go func() {
 		var previous controller.BackendObserved
-		stopped <- (Agent{Endpoint: endpoint}).Watch(ctx, func(_ context.Context, e controller.Event) error {
+		stopped <- liveAgent(endpoint).Watch(ctx, func(_ context.Context, e controller.Event) error {
 			if state, ok := e.(controller.BackendObserved); ok && state != previous {
 				previous = state
 				events <- state
@@ -90,7 +103,7 @@ func TestLiveBackgroundOnlySession(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	session, err := Open(ctx, Config{LibvirtSocket: socket, LibvirtURI: "qemu:///system", Domain: "win11", AgentEndpoint: endpoint})
+	session, err := Open(ctx, Config{LibvirtSocket: socket, LibvirtURI: "qemu:///system", Domain: "win11", AgentEndpoint: endpoint, AgentToken: liveAgent(endpoint).AuthToken})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,4 +151,33 @@ func TestLiveBackgroundOnlySession(t *testing.T) {
 		t.Fatal(state, err)
 	}
 	t.Logf("VM=%s backend=%s SSH=%s FreeRDP=%v", state.VM, response.Role, state.SSH, state.Display)
+	// Disconnect only this test's real libvirt observation socket. The Session
+	// must survive, subscribe again and refresh without another client request.
+	session.vm.mu.Lock()
+	oldSource := session.vm.current
+	session.vm.mu.Unlock()
+	if oldSource == nil {
+		t.Fatal("missing acknowledged lifecycle source")
+	}
+	oldSource.shutdown()
+	for {
+		session.vm.mu.Lock()
+		replaced := session.vm.current != nil && session.vm.current != oldSource
+		session.vm.mu.Unlock()
+		state, err := session.Controller.Snapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if replaced && state.VM == controller.VMRunning && state.BackendReady {
+			t.Log("real lifecycle disconnect recovered with a new subscription and VM snapshot; no new request or FreeRDP")
+			break
+		}
+		select {
+		case err := <-stopped:
+			t.Fatal("session exited on source loss", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }

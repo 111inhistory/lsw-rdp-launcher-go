@@ -34,8 +34,12 @@ func TestLiveMemorySmallResize(t *testing.T) {
 	stopped := make(chan error, 1)
 	go func() {
 		stopped <- memory.Watch(ctx, func(ctx context.Context, event controller.Event) error {
+			state, ok := event.(controller.MemoryDeviceObserved)
+			if !ok {
+				return nil // Subscription readiness is not a device-size event.
+			}
 			select {
-			case events <- event.(controller.MemoryDeviceObserved):
+			case events <- state:
 				return nil
 			case <-ctx.Done():
 				return ctx.Err()
@@ -59,11 +63,13 @@ func TestLiveMemorySmallResize(t *testing.T) {
 	if old.RequestedBytes%controller.MemoryQuantum != 0 {
 		t.Fatal("baseline requested must be restorable on the128MiB grid", old)
 	}
-	target := (old.ActualBytes/controller.MemoryQuantum + 1) * controller.MemoryQuantum
+	// A preceding test can have restored requested before the driver finishes
+	// plugging it. Grow above both values, never turn this into partial reclaim.
+	target := (max(old.ActualBytes, old.RequestedBytes)/controller.MemoryQuantum + 1) * controller.MemoryQuantum
 	if target > old.CapacityBytes {
 		t.Skip("no headroom for one128MiB test quantum")
 	}
-	agent := Agent{Endpoint: endpoint}
+	agent := liveAgent(endpoint)
 	before, err := agent.Call(ctx, controller.Request{Action: "status"})
 	if err != nil || before.Memory == nil {
 		t.Fatal(before, err)

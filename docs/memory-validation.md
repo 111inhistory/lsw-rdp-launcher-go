@@ -1,6 +1,36 @@
 # 内存功能验证记录
 
-日期：2026-10-19 至 2026-10-20。环境：win11、QEMU 10.2.2、libvirt 12.0.0、viomem 100.101.104.28500。
+日期：2026-10-19 至 2026-10-21。环境：win11、QEMU 10.2.2、libvirt 12.0.0、viomem 100.101.104.28500。
+
+## 2026-10-21 真机复验（生产代码基线 1221f034）
+
+使用当前 Go 代码、真实 libvirt/QEMU 与新构建的 Windows agent。原部署的 Linux CLI 不支持 `--version`，仍是旧版本；没有替换安装文件。Windows 使用临时 SYSTEM 任务、独立端口 49253 及临时 token。内存测试期间停止原常驻服务，最后一轮内存复跑确认入口及出口没有其他 Linux 控制器进程。
+
+实测结果：
+
+- 6 项 `TestLive*` 均通过：后台 watch、仅后台 Session、回收／暂停／恢复、小幅扩容、暂停窗口准备、内存来源合并。
+- 同一 TCP 订阅静默 32 秒，随后真实 SSH 连接触发 nonzero；没有心跳保活。
+- 主动关闭测试 Session 自己的真实 libvirt 订阅连接，Session 不退出；重新订阅并补查后 VM Running、后台就绪，无新客户端请求或 FreeRDP。
+- 最后一轮回收约 5.54 秒开始，约 35.54 秒确认 Paused；安全准备后恢复 Running 并取得新观测。
+- 扩容目标 1.25 GiB，QMP 与 Windows 物理内存均反映变化。首次复验暴露了测试前提错误：前一用例恢复 requested 后 actual 仍在追赶，按 actual 算目标会误触发缩容。改为高于 `max(actual, requested)` 的下一个量子后通过。
+- 新来源会先发送订阅确认消息，旧 live 回调的强制类型断言已改为只消费对应状态事件。live 客户端支持 `RDP_LIVE_TOKEN_FILE`，不再默认对新端点发送无 token 请求。
+- 清理路径保持安全目标直到 VM 恢复 Running，再恢复原 requested；不在部分回收时先降低安全目标再恢复 CPU。
+- Windows 原生测试 14/14 通过。真实 TCP 端点拒绝 ping/status/watch_status/quit 的缺失及错误 token，正确 token 可用。
+- ACL 临时 fixture 验收通过：指定用户及 SYSTEM 均读取相同 token，正确 ACL 通过，宽泛授权及 DENY ACE 拒绝。
+
+完整 live 运行通过后，安全清理修改又在真实窗口准备及 Session 观测用例中复验，并以四项内存用例整组复跑通过。随后补强“确认 Running 才降低目标”的清理检查，再单独实测暂停窗口准备通过。复现命令（先停止其他内存写者、准备带 token 的临时后台）：
+
+```sh
+RDP_LIVE_BACKGROUND=192.0.2.14:49253 \
+RDP_LIVE_TOKEN_FILE=/path/to/private-test-token \
+RDP_LIVE_MEMORY=1 \
+RDP_LIVE_LIBVIRT_SOCKET=/run/libvirt/virtqemud-sock \
+go test -race -count=1 -v ./internal/adapter -run '^TestLive' -timeout 240s
+```
+
+结束时 VM Running、后台就绪，原 systemd 服务恢复 active，队列和操作为空、LastError 为空。测试清理恢复各轮原 requested；驱动部分回收未完成，原服务重新准备窗口后 requested/actual 为 1.25 GiB，高于本轮最初的 1 GiB，**不声称内存完全还原**。恢复服务时发现另一个旧 watcher 占用 socket；确认无显示、排队或 SSH 活动后正常关闭它，交回原 systemd 服务。临时 SYSTEM 任务、防火墙规则及测试目录已清理；退出后可执行文件短暂锁定导致的目录残留也已等待并删除。
+
+范围限制：本轮未启动 FreeRDP、用户 GUI、注销会话或冷启动 VM，不算 RemoteApp／桌面切换全链路验收。开始时原服务已有 `FreeRDP exited during startup` 历史错误，本轮未复现或修复它。
 
 ## 本轮减法后复验
 

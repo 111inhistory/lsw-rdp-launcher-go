@@ -21,7 +21,7 @@ func TestLiveMemorySessionObservations(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	before, err := (Agent{Endpoint: endpoint}).Call(ctx, controller.Request{Action: "status"})
+	before, err := liveAgent(endpoint).Call(ctx, controller.Request{Action: "status"})
 	if err != nil || before.Memory == nil {
 		t.Fatal(before, err)
 	}
@@ -32,7 +32,7 @@ func TestLiveMemorySessionObservations(t *testing.T) {
 	if socket == "" {
 		socket = "/run/libvirt/libvirt-sock"
 	}
-	session, err := Open(ctx, Config{LibvirtSocket: socket, LibvirtURI: "qemu:///system", Domain: "win11", AgentEndpoint: endpoint, Policy: controller.Options{Memory: &controller.MemoryPolicy{}}})
+	session, err := Open(ctx, Config{LibvirtSocket: socket, LibvirtURI: "qemu:///system", Domain: "win11", AgentEndpoint: endpoint, AgentToken: liveAgent(endpoint).AuthToken, Policy: controller.Options{Memory: &controller.MemoryPolicy{}}})
 	if err != nil {
 		t.Fatal(err)
 	}

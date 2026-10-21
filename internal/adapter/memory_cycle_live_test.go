@@ -21,7 +21,7 @@ func TestLiveMemoryReclaimSuspendResume(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 65*time.Second)
 	defer cancel()
-	probe, err := (Agent{Endpoint: endpoint}).Call(ctx, controller.Request{Action: "status"})
+	probe, err := liveAgent(endpoint).Call(ctx, controller.Request{Action: "status"})
 	if err != nil || probe.Memory == nil {
 		t.Fatal(probe, err)
 	}
@@ -32,7 +32,7 @@ func TestLiveMemoryReclaimSuspendResume(t *testing.T) {
 	if socket == "" {
 		socket = "/run/libvirt/libvirt-sock"
 	}
-	session, err := Open(ctx, Config{LibvirtSocket: socket, LibvirtURI: "qemu:///system", Domain: "win11", AgentEndpoint: endpoint, Policy: controller.Options{VMSuspend: 35 * time.Second, Memory: &controller.MemoryPolicy{}}})
+	session, err := Open(ctx, Config{LibvirtSocket: socket, LibvirtURI: "qemu:///system", Domain: "win11", AgentEndpoint: endpoint, AgentToken: liveAgent(endpoint).AuthToken, Policy: controller.Options{VMSuspend: 35 * time.Second, Memory: &controller.MemoryPolicy{}}})
 	if err != nil {
 		t.Fatal(err)
 	}
