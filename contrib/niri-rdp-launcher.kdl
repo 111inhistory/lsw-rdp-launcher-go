@@ -8,8 +8,9 @@ window-rule {
     // Otherwise the focus ring's opaque fill can cover the wallpaper effect.
     draw-border-with-background false
     background-effect {
-        blur true
-        // Show blurred wallpaper, not terminal text from windows underneath.
+        // Match the sharp wallpaper backdrop of DMS settings; no forced fog.
+        blur false
+        // Show wallpaper, not terminal text from windows underneath.
         xray true
     }
 }

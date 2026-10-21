@@ -9,7 +9,7 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-func TestDMSGlassAndActiveMatugenPalette(t *testing.T) {
+func TestDMSFloatingSurfaceAndActiveMatugenPalette(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "DankMaterialShell")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -35,12 +35,16 @@ func TestDMSGlassAndActiveMatugenPalette(t *testing.T) {
 	for _, opaque := range []bool{false, true} {
 		d := &dialog{prompt: controller.SwitchPrompt{TargetMode: "desktop"}, style: style, opaque: opaque}
 		tt := ui.NewTester(d.view, 480, 220)
-		want := uint8(0) // No popup/white fill, even when popupTransparency is 0.6.
+		want := uint8(153) // Floating windows sync to the DMS popup alpha by default.
 		if opaque {
 			want = 255
 		}
 		if got := tt.Image().RGBAAt(8, 110).A; got != want {
 			t.Fatalf("opaque=%t alpha=%d, want %d", opaque, got, want)
+		}
+		card, ok := tt.Find("无法确认当前会话，仅支持保留切换。")
+		if !ok || tt.Image().RGBAAt(int(card.X+card.W/2), int(card.Y+card.H/2)).A != 255 {
+			t.Fatal("content card must stay opaque")
 		}
 		button, _ := tt.Find("保留并切换")
 		if got := tt.Image().RGBAAt(int(button.X+button.W/2), int(button.Y+button.H/2)).A; got != 255 {
@@ -48,11 +52,11 @@ func TestDMSGlassAndActiveMatugenPalette(t *testing.T) {
 		}
 	}
 
-	write("settings.json", `{"popupTransparency":0.6,"cornerRadius":8,"fontFamily":"Inter Variable","fontScale":1.25,"fontWeight":500}`)
+	write("settings.json", `{"popupTransparency":0.6,"floatingWindowSyncGlobal":false,"floatingWindowTransparency":0.25,"cornerRadius":8,"fontFamily":"Inter Variable","fontScale":1.25,"fontWeight":500}`)
 	style = loadDMSStyle(root, root)
 	theme = ui.LightTheme()
 	style.apply(theme)
-	if theme.Radius != 8 || theme.Font != "Inter Variable" || theme.FontSize != 17.5 || style.fontWeight != 500 {
+	if style.alpha != 64 || theme.Radius != 8 || theme.Font != "Inter Variable" || theme.FontSize != 17.5 || style.fontWeight != 500 {
 		t.Fatal("DMS typography or radius was ignored", style, theme)
 	}
 	d := &dialog{prompt: controller.SwitchPrompt{TargetMode: "desktop"}, style: style}

@@ -59,9 +59,9 @@ func (d *dialog) view(c *ui.Context) {
 	alpha := uint8(214)
 	if d.style != nil {
 		d.style.apply(&theme)
-		// DMS glass is a backdrop layer, not a popup-colored rectangle.
-		// Keep surface colors for controls and the opaque accessibility fallback.
-		background, alpha = theme.Background, 0
+		// Match DankFloatingWindow's surface alpha. The compositor supplies
+		// a sharp wallpaper backdrop; readable content has its own solid card.
+		background, alpha = theme.Background, d.style.alpha
 	}
 	if !d.opaque {
 		background.A = alpha // Only the panel is translucent; text/controls stay opaque.
@@ -79,12 +79,14 @@ func (d *dialog) view(c *ui.Context) {
 	}
 	ui.Column(c).Fill().Padding(24 * scale).Gap(12 * scale).Radius(theme.Radius).Background(background).FontWeight(weight).Children(func() {
 		ui.Text(c, "切换到"+target+"？").FontSize(20 * scale).FontWeight(min(weight+100, 900))
-		if a.CanLogoff() {
-			ui.Text(c, "窗口 "+count(a.Windows)+" · 托盘 "+count(a.TrayIcons)).TextColor(theme.TextMuted)
-		} else {
-			ui.Text(c, "无法确认当前会话，仅支持保留切换。").TextColor(theme.TextMuted)
-		}
-		ui.Text(c, "注销将关闭所有应用，未保存的内容会丢失。").TextColor(theme.TextMuted)
+		ui.Column(c).FillWidth().Padding(12 * scale).Gap(8 * scale).Radius(theme.Radius).Background(theme.Surface).Children(func() {
+			if a.CanLogoff() {
+				ui.Text(c, "窗口 "+count(a.Windows)+" · 托盘 "+count(a.TrayIcons)).TextColor(theme.TextMuted)
+			} else {
+				ui.Text(c, "无法确认当前会话，仅支持保留切换。").TextColor(theme.TextMuted)
+			}
+			ui.Text(c, "注销将关闭所有应用，未保存的内容会丢失。").TextColor(theme.TextMuted)
+		})
 		ui.Box(c).Fill()
 		ui.Row(c).Gap(12 * scale).Justify(ui.End).Children(func() {
 			if ui.Button(c.Key("cancel"), "取消").Height(40*scale).Padding(0, 16*scale).FontWeight(500).AutoFocus().Clicked() {
