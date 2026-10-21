@@ -1,11 +1,14 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/111inhistory/lsw-rdp-launcher-go/internal/controller"
 )
@@ -17,7 +20,19 @@ func liveAgent(endpoint string) Agent {
 	if path := os.Getenv("RDP_LIVE_TOKEN_FILE"); path != "" {
 		agent.AuthToken = func(context.Context) (string, error) {
 			data, err := os.ReadFile(path)
-			return string(data), err
+			if err != nil {
+				return "", err
+			}
+			// Match Windows Token::load: one final LF/CRLF is a line ending,
+			// not part of the token. Preserve spaces and reject all other CR/LF.
+			if bytes.HasSuffix(data, []byte{'\n'}) {
+				data = bytes.TrimSuffix(data, []byte{'\n'})
+				data = bytes.TrimSuffix(data, []byte{'\r'})
+			}
+			if len(data) == 0 || bytes.ContainsAny(data, "\r\n") || !utf8.Valid(data) {
+				return "", fmt.Errorf("invalid live token file: empty, multiline or non-UTF-8")
+			}
+			return string(data), nil
 		}
 	}
 	return agent
