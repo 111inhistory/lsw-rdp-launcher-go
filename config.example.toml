@@ -1,0 +1,75 @@
+# Copy to ~/.config/rdp-launcher-go/config.toml. Do not store passwords here.
+[server]
+host = "192.0.2.10" # Explicit guest IP; no address discovery.
+user = "Administrator"
+service = "rdp-bridge" # Keyring service for the RDP password (username = user).
+agent_service = "rdp-bridge-agent" # Separate keyring service; username is always "agent".
+# Windows-side path of the shared token file. Passed to the interactive daemon
+# started by FreeRDP; only the path enters argv, never the token. The background
+# service must be given the same --auth-token-file separately. The file ACL must
+# allow SYSTEM and the configured interactive Windows user; Administrators may
+# also be present as a trusted machine-admin exception. Use
+# windows-agent/install.ps1 to provision and verify it. Spaces/tabs inside the
+# token are preserved; only CR/LF are rejected.
+agent_token_file = 'C:\ProgramData\rdp-launcher\agent-token'
+agent_port = 49152
+backend_port = 49153
+
+[libvirt]
+socket = "/run/libvirt/libvirt-sock"
+uri = "qemu:///system"
+
+[freerdp]
+bin = "sdl-freerdp"
+app_id = "com.freerdp.client.sdl3" # Niri observation; set to your client’s actual app_id.
+video_driver = "wayland"
+scale_desktop = 200
+clipboard = true
+cert_ignore = false # Use true only for a trusted development VM's self-signed certificate.
+extra_args = []
+
+[ui]
+dialog_bin = "rdp-launcher-dialog" # 可填绝对路径；仅在需要用户确认时启动。
+
+[remoteapp]
+default_app = 'C:\RdpLauncher\bin\remoteapp-launcher.exe'
+
+[lifecycle]
+vm_name = "win11"
+idle_disconnect_timeout = 30 # Seconds; 0 disables.
+vm_suspend_timeout = 300 # Seconds; 0 disables.
+virtio_mem_alias = "ua-virtiomem0"
+
+# Both agent ports use the shared token from agent_service / agent_token_file.
+# Loopback-only Windows binds may omit the token file, but the host uses the
+# guest IP here, so RemoteApp requires the file and background service flag.
+
+# Omit this section to disable automatic memory control.
+[memory]
+start_percent = 95
+stop_percent = 80
+
+# Host directories exposed to the guest through existing mapped drives.
+# This does not create SMB shares or change Windows drive mappings.
+[mounts]
+# "J:" = "/data/shared"
+
+# Applications absent from Windows discovery. ID, name and target are required.
+# These entries work without a prior sync. Optional: arguments, working_dir, icon.
+[[apps]]
+id = "explorer"
+name = "Windows File Explorer"
+target = 'C:\Windows\explorer.exe'
+# Supply the actual Windows application icon, not another file manager’s icon.
+# icon = "/absolute/path/to/windows-explorer.png"
+
+[filters]
+# 精确匹配 ID、名称、远端目标或 .lnk 路径；不支持模糊匹配。
+exclude_apps = ["documentation-for-desktop-apps", "sample-desktop-apps", "tools-for-desktop-apps"]
+# 按 Windows 路径比较来源/目标目录，含子目录，不使用 Linux 路径。
+exclude_dirs = ['C:\Program Files (x86)\Windows Kits\10\Shortcuts']
+
+[[overrides]]
+match = "excel"
+mimes = ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "text/csv"]
+categories = "Office;Spreadsheet;RemoteAccess;"

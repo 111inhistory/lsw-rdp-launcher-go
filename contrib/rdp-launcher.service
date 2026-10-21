@@ -1,0 +1,13 @@
+[Unit]
+Description=RDP Launcher Go controller
+PartOf=graphical-session.target
+After=graphical-session-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rdp-launcher serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

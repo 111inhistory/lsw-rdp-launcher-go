@@ -1,0 +1,5 @@
+/windows-agent/target/
+/.pi/
+/bin/
+/rdp-launcher
+*.log
