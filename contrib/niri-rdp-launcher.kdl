@@ -1,0 +1,15 @@
+// niri >= 26.04. Only the RDP Launcher confirmation dialog is affected.
+// The application draws an alpha background, not globally faded text/buttons.
+window-rule {
+    match app-id="^rdp-launcher-dialog$"
+    open-floating true
+    geometry-corner-radius 16
+    clip-to-geometry true
+    // Otherwise the focus ring's opaque fill can cover the wallpaper effect.
+    draw-border-with-background false
+    background-effect {
+        blur true
+        // Show blurred wallpaper, not terminal text from windows underneath.
+        xray true
+    }
+}

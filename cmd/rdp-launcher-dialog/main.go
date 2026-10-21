@@ -16,6 +16,7 @@ type dialog struct {
 	prompt   controller.SwitchPrompt
 	decision controller.SwitchDecision
 	done     bool
+	opaque   bool // Accessibility preference: do not draw translucent surfaces.
 	close    func()
 }
 
@@ -38,31 +39,34 @@ func (d *dialog) view(c *ui.Context) {
 	if c.Shortcut(0, ui.KeyEscape) {
 		d.choose(controller.SwitchCancel)
 	}
-	theme := c.Theme()
-	ui.Column(c).Fill().Padding(24).Gap(16).Children(func() {
-		ui.Text(c, "切换 Windows 连接模式").FontSize(22).Bold()
-		target := "RemoteApp"
-		if d.prompt.TargetMode == "desktop" {
-			target = "完整桌面"
+	// Keep the system's light/dark appearance, accent and font. Use a subtle
+	// accent tint and round controls instead of a stark white information panel.
+	theme := *c.Theme()
+	theme.Surface = theme.Background.Mix(theme.Accent, 0.08)
+	theme.SurfaceHover = theme.Background.Mix(theme.Accent, 0.14)
+	theme.SurfacePressed = theme.Background.Mix(theme.Accent, 0.20)
+	theme.Border = theme.Surface
+	theme.Radius = 18
+	background := theme.Background.Mix(theme.Accent, 0.04)
+	if !d.opaque {
+		background.A = 214 // Only the panel is translucent; text/controls stay opaque.
+		theme.Background = ui.Transparent
+	}
+	c.SetTheme(&theme)
+	target := "RemoteApp"
+	if d.prompt.TargetMode == "desktop" {
+		target = "完整桌面"
+	}
+	a := d.prompt.Activity
+	ui.Column(c).Fill().Padding(24).Gap(12).Background(background).Children(func() {
+		ui.Text(c, "切换到"+target+"？").FontSize(20).Bold()
+		if a.CanLogoff() {
+			ui.Text(c, "窗口 "+count(a.Windows)+" · 托盘 "+count(a.TrayIcons)).TextColor(theme.TextMuted)
+		} else {
+			ui.Text(c, "无法确认当前会话，仅支持保留切换。").TextColor(theme.TextMuted)
 		}
-		ui.Scroll(c).Fill().Children(func() {
-			ui.Column(c).FillWidth().Gap(12).Children(func() {
-				ui.Text(c, "将切换到："+target)
-				a := d.prompt.Activity
-				session := "未能唯一确定当前会话"
-				if a.SessionID != 0 {
-					session = fmt.Sprintf("当前会话：%d · %s", a.SessionID, a.User)
-				}
-				ui.Text(c, session).TextColor(theme.TextMuted)
-				ui.Text(c, "用户窗口："+count(a.Windows)+"    用户托盘："+count(a.TrayIcons))
-				if a.Note != "" {
-					ui.Text(c, a.Note).TextColor(theme.TextMuted)
-				}
-				ui.Text(c, "保留：应用留在旧会话中，不会出现在另一种模式的会话里。")
-				ui.Text(c, "注销：关闭旧会话中的所有应用，未保存的内容可能丢失。").TextColor(theme.Danger)
-			})
-		})
-		a := d.prompt.Activity
+		ui.Text(c, "注销将关闭所有应用，未保存的内容会丢失。").TextColor(theme.TextMuted)
+		ui.Box(c).Fill()
 		ui.Row(c).Gap(12).Justify(ui.End).Children(func() {
 			if ui.Button(c.Key("cancel"), "取消").AutoFocus().Clicked() {
 				d.choose(controller.SwitchCancel)
@@ -89,7 +93,9 @@ func main() {
 	d := &dialog{prompt: prompt, decision: controller.SwitchCancel}
 	mygo.App.SetName("RDP Launcher")
 	mygo.App.WhenReady(func() {
-		window := mygo.NewWindow(mygo.WindowOptions{Title: "切换 Windows 连接模式", Width: 640, Height: 420, MinWidth: 600, MinHeight: 400, Content: ui.View(d.view)})
+		prefs := mygo.Theme.Preferences()
+		d.opaque = prefs.ReduceTransparency || prefs.HighContrast
+		window := mygo.NewWindow(mygo.WindowOptions{Title: "切换 Windows 连接模式", Width: 480, Height: 220, MinWidth: 480, MinHeight: 220, DisableResize: true, Transparent: true, Content: ui.View(d.view)})
 		d.close = window.Close
 		window.OnClosed(func() {
 			if !d.done {
