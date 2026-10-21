@@ -9,7 +9,7 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-func TestDMSPopupAlphaAndActiveMatugenPalette(t *testing.T) {
+func TestDMSGlassAndActiveMatugenPalette(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "DankMaterialShell")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -24,8 +24,8 @@ func TestDMSPopupAlphaAndActiveMatugenPalette(t *testing.T) {
 	write("settings.json", `{"popupTransparency":0.6}`)
 	write("dms-colors.json", `{"mode":"light","colors":{"light":{"surface_container":"#f6fafe","primary":"#1b6484"},"dark":{"primary":"#abcdef"}}}`)
 	style := loadDMSStyle(root, root)
-	if style == nil || style.alpha != 153 {
-		t.Fatal("DMS transparency is alpha, not one minus alpha", style)
+	if style == nil {
+		t.Fatal("DMS style not loaded")
 	}
 	theme := ui.LightTheme()
 	style.apply(theme)
@@ -35,7 +35,7 @@ func TestDMSPopupAlphaAndActiveMatugenPalette(t *testing.T) {
 	for _, opaque := range []bool{false, true} {
 		d := &dialog{prompt: controller.SwitchPrompt{TargetMode: "desktop"}, style: style, opaque: opaque}
 		tt := ui.NewTester(d.view, 480, 220)
-		want := uint8(153)
+		want := uint8(0) // No popup/white fill, even when popupTransparency is 0.6.
 		if opaque {
 			want = 255
 		}
@@ -64,13 +64,13 @@ func TestDMSPopupAlphaAndActiveMatugenPalette(t *testing.T) {
 		}
 	}
 
-	write("settings.json", `{"popupTransparency":2}`)
+	write("settings.json", `{"cornerRadius":-1,"fontScale":0,"fontWeight":10}`)
 	write("dms-colors.json", `{"mode":"dark","colors":{"dark":{"primary":"invalid"}}}`)
 	style = loadDMSStyle(root, root)
 	theme = ui.DarkTheme()
 	accent := theme.Accent
 	style.apply(theme)
-	if style.alpha != 214 || theme.Accent != accent {
+	if style.radius != 12 || style.fontScale != 1 || style.fontWeight != 400 || theme.Accent != accent {
 		t.Fatal("invalid settings should preserve defaults", style, theme)
 	}
 }

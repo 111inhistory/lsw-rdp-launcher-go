@@ -59,7 +59,9 @@ func (d *dialog) view(c *ui.Context) {
 	alpha := uint8(214)
 	if d.style != nil {
 		d.style.apply(&theme)
-		background, alpha = theme.Background, d.style.alpha
+		// DMS glass is a backdrop layer, not a popup-colored rectangle.
+		// Keep surface colors for controls and the opaque accessibility fallback.
+		background, alpha = theme.Background, 0
 	}
 	if !d.opaque {
 		background.A = alpha // Only the panel is translucent; text/controls stay opaque.

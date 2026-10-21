@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,11 +9,10 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-// DMS already renders Matugen colors. Reuse its active palette and popup alpha
+// DMS already renders Matugen colors. Reuse its active palette and metrics
 // instead of adding another template/output file or a second theme generator.
 type dmsStyle struct {
 	colors     map[string]string
-	alpha      uint8
 	radius     float32
 	font       string
 	fontScale  float32
@@ -22,14 +20,13 @@ type dmsStyle struct {
 }
 
 func loadDMSStyle(configDir, cacheDir string) *dmsStyle {
-	style := &dmsStyle{alpha: 214, radius: 12, font: "Inter Variable", fontScale: 1, fontWeight: 400}
+	style := &dmsStyle{radius: 12, font: "Inter Variable", fontScale: 1, fontWeight: 400}
 	found := false
 	var settings struct {
-		PopupTransparency *float64 `json:"popupTransparency"`
-		CornerRadius      *float32 `json:"cornerRadius"`
-		FontFamily        string   `json:"fontFamily"`
-		FontScale         float32  `json:"fontScale"`
-		FontWeight        int      `json:"fontWeight"`
+		CornerRadius *float32 `json:"cornerRadius"`
+		FontFamily   string   `json:"fontFamily"`
+		FontScale    float32  `json:"fontScale"`
+		FontWeight   int      `json:"fontWeight"`
 	}
 	if data, err := os.ReadFile(filepath.Join(configDir, "DankMaterialShell", "settings.json")); err == nil && json.Unmarshal(data, &settings) == nil {
 		found = true
@@ -44,10 +41,6 @@ func loadDMSStyle(configDir, cacheDir string) *dmsStyle {
 		}
 		if settings.FontWeight >= 100 && settings.FontWeight <= 900 {
 			style.fontWeight = settings.FontWeight
-		}
-		if alpha := settings.PopupTransparency; alpha != nil && *alpha >= 0 && *alpha <= 1 {
-			style.alpha = uint8(math.Round(*alpha * 255))
-			found = true
 		}
 	}
 	var palette struct {
