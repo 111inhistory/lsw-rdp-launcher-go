@@ -29,6 +29,11 @@ clipboard = true
 cert_ignore = false # Use true only for a trusted development VM's self-signed certificate.
 extra_args = []
 
+# Optional: FreeRDP child environment only. Explicit values override inherited
+# values and video_driver; empty strings are kept. No shell expansion.
+[freerdp.env]
+# SDL_RENDER_DRIVER = "opengl"
+
 [ui]
 dialog_bin = "rdp-launcher-dialog" # 可填绝对路径；仅在需要用户确认时启动。
 

@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -22,6 +23,7 @@ type DisplayConfig struct {
 	ScaleDesktop                 int
 	Clipboard, IgnoreCertificate bool
 	ExtraArgs                    []string
+	Env                          map[string]string // Explicit child-only overrides, including empty values.
 	// AgentTokenFile is the Windows-side path of the shared agent token file.
 	// Only the path enters the RemoteApp command line; the token itself stays
 	// in the keyring and file. Empty keeps the explicit loopback-only mode.
@@ -100,6 +102,10 @@ func (d *Display) Start(ctx context.Context, id uint64, desktop bool) error {
 	if err != nil {
 		return err
 	}
+	env, err := displayEnvironment(d.config.VideoDriver, d.config.Env)
+	if err != nil {
+		return err
+	}
 	if d.config.Password == nil {
 		return fmt.Errorf("FreeRDP password provider is not configured")
 	}
@@ -126,7 +132,7 @@ func (d *Display) Start(ctx context.Context, id uint64, desktop bool) error {
 	command.Stdout, command.Stderr = d.config.Log, d.config.Log
 	// Credentials are sent through stdin, not argv or environment variables.
 	command.Stdin = strings.NewReader(password + "\n")
-	command.Env = displayEnvironment(d.config.VideoDriver)
+	command.Env = env
 	if err = command.Start(); err != nil {
 		return err
 	}
@@ -204,18 +210,35 @@ func (d *Display) Stop(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
-func displayEnvironment(driver string) []string {
-	var env []string
+func displayEnvironment(driver string, overrides map[string]string) ([]string, error) {
+	values := make(map[string]string)
 	for _, entry := range os.Environ() {
-		key, _, _ := strings.Cut(entry, "=")
+		key, value, _ := strings.Cut(entry, "=")
 		switch strings.ToLower(key) {
 		case "http_proxy", "https_proxy", "all_proxy", "no_proxy":
 			continue
 		}
-		env = append(env, entry)
+		values[key] = value
 	}
 	if driver != "" {
-		env = append(env, "SDL_VIDEODRIVER="+driver)
+		values["SDL_VIDEODRIVER"] = driver
 	}
-	return env
+	// Explicit configuration wins over inheritance and video_driver. Proxy
+	// variables are not inherited, but may be deliberately configured here.
+	for key, value := range overrides {
+		if key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsRune(value, '\x00') {
+			return nil, fmt.Errorf("invalid FreeRDP environment entry: key must be non-empty without = or NUL; values must not contain NUL")
+		}
+		values[key] = value
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		env = append(env, key+"="+values[key])
+	}
+	return env, nil
 }

@@ -37,8 +37,9 @@ type Config struct {
 		VideoDriver  string `toml:"video_driver"`
 		ScaleDesktop int    `toml:"scale_desktop"`
 		Clipboard    bool
-		CertIgnore   bool     `toml:"cert_ignore"`
-		ExtraArgs    []string `toml:"extra_args"`
+		CertIgnore   bool              `toml:"cert_ignore"`
+		ExtraArgs    []string          `toml:"extra_args"`
+		Env          map[string]string `toml:"env"`
 	}
 	UI struct {
 		DialogBinary string `toml:"dialog_bin"`
@@ -142,7 +143,7 @@ func (c Config) Adapter() (adapter.Config, error) {
 		InteractiveEndpoint: net.JoinHostPort(c.Server.Host, strconv.Itoa(c.Server.AgentPort)),
 		NiriSocket:          os.Getenv("NIRI_SOCKET"), FreeRDPAppID: c.FreeRDP.AppID, MemoryAlias: c.Lifecycle.MemoryAlias, Policy: policy,
 		AgentToken: c.AgentToken,
-		Display:    adapter.DisplayConfig{Binary: c.FreeRDP.Bin, Host: c.Server.Host, User: c.Server.User, Program: c.RemoteApp.DefaultApp, VideoDriver: c.FreeRDP.VideoDriver, ScaleDesktop: c.FreeRDP.ScaleDesktop, Clipboard: c.FreeRDP.Clipboard, IgnoreCertificate: c.FreeRDP.CertIgnore, ExtraArgs: c.FreeRDP.ExtraArgs, AgentTokenFile: c.Server.AgentTokenFile, Log: os.Stderr, Password: c.Password},
+		Display:    adapter.DisplayConfig{Binary: c.FreeRDP.Bin, Host: c.Server.Host, User: c.Server.User, Program: c.RemoteApp.DefaultApp, VideoDriver: c.FreeRDP.VideoDriver, ScaleDesktop: c.FreeRDP.ScaleDesktop, Clipboard: c.FreeRDP.Clipboard, IgnoreCertificate: c.FreeRDP.CertIgnore, ExtraArgs: c.FreeRDP.ExtraArgs, Env: c.FreeRDP.Env, AgentTokenFile: c.Server.AgentTokenFile, Log: os.Stderr, Password: c.Password},
 	}, nil
 }
 

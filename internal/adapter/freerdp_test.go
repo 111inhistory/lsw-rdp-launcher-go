@@ -119,6 +119,7 @@ func TestFreeRDPArgumentsStdinAndOwnedExit(t *testing.T) {
 			events := make(chan controller.DisplayExited, 1)
 			config := displayTestConfig()
 			config.Log = writer
+			config.Env = map[string]string{"RDP_ENV_TEST": "literal $HOME = value", "RDP_ENV_EMPTY": ""}
 			d := NewDisplay(root, config, a, func(_ context.Context, event controller.Event) error {
 				events <- event.(controller.DisplayExited)
 				return nil
@@ -151,6 +152,17 @@ func TestFreeRDPArgumentsStdinAndOwnedExit(t *testing.T) {
 			}
 			if capture.Input != "test-only-password\n" || strings.Contains(args, "test-only-password") {
 				t.Fatal(capture.Input, args)
+			}
+			for key, value := range config.Env {
+				found := false
+				for _, entry := range capture.Env {
+					if entry == key+"="+value {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatal("child did not receive configured environment", key)
+				}
 			}
 			for _, entry := range capture.Env {
 				key, value, _ := strings.Cut(entry, "=")
