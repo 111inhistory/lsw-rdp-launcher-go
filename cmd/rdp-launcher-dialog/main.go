@@ -54,14 +54,19 @@ func (d *dialog) view(c *ui.Context) {
 	theme.SurfaceHover = theme.Background.Mix(theme.Accent, 0.14)
 	theme.SurfacePressed = theme.Background.Mix(theme.Accent, 0.20)
 	theme.Border = theme.Surface
-	theme.Radius = 18
+	if d.style == nil {
+		theme.Radius = 18
+	}
 	background := theme.Background.Mix(theme.Accent, 0.04)
 	alpha := uint8(214)
 	if d.style != nil {
 		d.style.apply(&theme)
 		// Match DankFloatingWindow's surface alpha. The compositor supplies
 		// a sharp wallpaper backdrop; readable content has its own solid card.
-		background, alpha = theme.Background, d.style.alpha
+		background = theme.Background
+		if d.style.hasSettings {
+			alpha = d.style.alpha
+		}
 	}
 	if !d.opaque {
 		background.A = alpha // Only the panel is translucent; text/controls stay opaque.
@@ -79,17 +84,26 @@ func (d *dialog) view(c *ui.Context) {
 	}
 	ui.Column(c).Fill().Padding(24 * scale).Gap(12 * scale).Radius(theme.Radius).Background(background).FontWeight(weight).Children(func() {
 		ui.Text(c, "切换到"+target+"？").FontSize(20 * scale).FontWeight(min(weight+100, 900))
-		ui.Column(c).FillWidth().Padding(12 * scale).Gap(8 * scale).Radius(theme.Radius).Background(theme.Surface).Children(func() {
-			if a.CanLogoff() {
-				ui.Text(c, "窗口 "+count(a.Windows)+" · 托盘 "+count(a.TrayIcons)).TextColor(theme.TextMuted)
-			} else {
-				ui.Text(c, "无法确认当前会话，仅支持保留切换。").TextColor(theme.TextMuted)
-			}
-			ui.Text(c, "注销将关闭所有应用，未保存的内容会丢失。").TextColor(theme.TextMuted)
+		// Keep the actions outside the scroll viewport: font fallback or
+		// oversized text must not push Cancel/Keep/Logoff off-screen.
+		ui.Scroll(c).Fill().Children(func() {
+			ui.Column(c).FillWidth().Padding(12 * scale).Gap(8 * scale).Radius(theme.Radius).Background(theme.Surface).Children(func() {
+				if a.CanLogoff() {
+					ui.Text(c, "窗口 "+count(a.Windows)+" · 托盘 "+count(a.TrayIcons)).TextColor(theme.TextMuted)
+				} else {
+					ui.Text(c, "无法确认当前会话，仅支持保留切换。").TextColor(theme.TextMuted)
+				}
+				ui.Text(c, "注销将关闭所有应用，未保存的内容会丢失。").TextColor(warningColor(&theme))
+			})
 		})
-		ui.Box(c).Fill()
 		ui.Row(c).Gap(12 * scale).Justify(ui.End).Children(func() {
-			if ui.Button(c.Key("cancel"), "取消").Height(40*scale).Padding(0, 16*scale).FontWeight(500).AutoFocus().Clicked() {
+			cancel := ui.Button(c.Key("cancel"), "取消").Height(40*scale).Padding(0, 16*scale).FontWeight(500).AutoFocus()
+			// AutoFocus need not enable MyGo's keyboard-only focus ring. Draw
+			// an explicit outline while focused, including the first opening.
+			if cancel.Focused() {
+				cancel.Border(2*scale, theme.Accent)
+			}
+			if cancel.Clicked() {
 				d.choose(controller.SwitchCancel)
 			}
 			if ui.Button(c.Key("logoff"), "注销并切换").Height(40*scale).Padding(0, 16*scale).FontWeight(500).Disabled(!a.CanLogoff()).TextColor(theme.Danger).Clicked() {

@@ -83,6 +83,60 @@ func TestUnknownSessionCannotBeLoggedOff(t *testing.T) {
 	}
 }
 
+func TestCancelFocusAndLogoffWarningAreVisible(t *testing.T) {
+	d := &dialog{prompt: controller.SwitchPrompt{TargetMode: "desktop"}, decision: controller.SwitchCancel}
+	tt := ui.NewTester(d.view, 480, 220)
+	tt.Frame()
+	if !tt.Focused("取消") {
+		t.Fatal("Cancel lacks initial focus")
+	}
+	button, _ := tt.Find("取消")
+	image := tt.Image()
+	accent := ui.LightTheme().Accent
+	focusPixels := 0
+	// Find returns the label bounds; the control outline is outside them.
+	for y := int(button.Y) - 16; y < int(button.Y+button.H)+16; y++ {
+		for x := int(button.X) - 16; x < int(button.X+button.W)+16; x++ {
+			p := image.RGBAAt(x, y)
+			if p.R == accent.R && p.G == accent.G && p.B == accent.B {
+				focusPixels++
+			}
+		}
+	}
+	if focusPixels < 8 {
+		t.Fatal("Cancel focus outline is not visible")
+	}
+	warning, _ := tt.Find("注销将关闭所有应用，未保存的内容会丢失。")
+	card := ui.LightTheme().Background.Mix(ui.LightTheme().Accent, 0.08)
+	for y := int(warning.Y); y < int(warning.Y+warning.H); y++ {
+		for x := int(warning.X); x < int(warning.X+warning.W); x++ {
+			p := image.RGBAAt(x, y)
+			if p.R > p.G && int(p.G) > 2*int(p.B) && contrastRatio(ui.RGB(p.R, p.G, p.B), card) >= 4.5 {
+				return
+			}
+		}
+	}
+	t.Fatal("warning has no readable amber text")
+}
+
+func TestScrollableBodyPreservesActionsWithLargeFonts(t *testing.T) {
+	for _, scale := range []float32{1, 1.5, 2} {
+		d := &dialog{prompt: controller.SwitchPrompt{TargetMode: "desktop"}, style: &dmsStyle{hasSettings: true, alpha: 153, radius: 12, font: "sans-serif", fontScale: scale, fontWeight: 700}}
+		width, height := int(480*scale), int(180*scale)
+		tt := ui.NewTester(d.view, width, height)
+		for _, label := range []string{"取消", "保留并切换", "注销并切换"} {
+			r, ok := tt.Find(label)
+			if !ok || r.X < 0 || r.Y < 0 || r.X+r.W > float32(width) || r.Y+r.H > float32(height) {
+				t.Fatal("action clipped with constrained scroll body", scale, label, r)
+			}
+		}
+		tt.Key(0, ui.KeyEnter)
+		if !d.done || d.decision != controller.SwitchCancel {
+			t.Fatal("large-font Enter did not cancel")
+		}
+	}
+}
+
 func TestPanelTransparencyKeepsControlsOpaque(t *testing.T) {
 	for _, opaque := range []bool{false, true} {
 		d := &dialog{prompt: controller.SwitchPrompt{TargetMode: "desktop"}, opaque: opaque}

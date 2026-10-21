@@ -79,6 +79,36 @@ func TestDMSFloatingSurfaceAndActiveMatugenPalette(t *testing.T) {
 	}
 }
 
+func TestDMSPaletteAlonePreservesSystemMetrics(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "DankMaterialShell")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dms-colors.json"), []byte(`{"mode":"light","colors":{"light":{"primary":"#123456"}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	style := loadDMSStyle(root, root)
+	if style == nil || style.hasSettings {
+		t.Fatal("palette-only style has settings", style)
+	}
+	theme := ui.LightTheme()
+	theme.Font, theme.FontSize, theme.Radius, theme.Spacing = "system-ui", 19, 7, 5
+	style.apply(theme)
+	if theme.Font != "system-ui" || theme.FontSize != 19 || theme.Radius != 7 || theme.Spacing != 5 || theme.Accent != ui.Hex("#123456") {
+		t.Fatal("palette changed system typography or metrics", theme)
+	}
+	for _, invalid := range []string{"null", "not json"} {
+		if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(invalid), 0600); err != nil {
+			t.Fatal(err)
+		}
+		style = loadDMSStyle(root, root)
+		if style == nil || style.hasSettings {
+			t.Fatal("invalid settings must not supply font/metric defaults", style)
+		}
+	}
+}
+
 func TestDMSMissingOrMalformedFilesUseSystemTheme(t *testing.T) {
 	root := t.TempDir()
 	if style := loadDMSStyle(root, root); style != nil {

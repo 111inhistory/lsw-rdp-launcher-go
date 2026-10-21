@@ -13,18 +13,19 @@ import (
 // DMS already renders Matugen colors. Reuse its active palette and metrics
 // instead of adding another template/output file or a second theme generator.
 type dmsStyle struct {
-	colors     map[string]string
-	alpha      uint8
-	radius     float32
-	font       string
-	fontScale  float32
-	fontWeight int
+	colors      map[string]string
+	hasSettings bool
+	alpha       uint8
+	radius      float32
+	font        string
+	fontScale   float32
+	fontWeight  int
 }
 
 func loadDMSStyle(configDir, cacheDir string) *dmsStyle {
 	style := &dmsStyle{alpha: 255, radius: 12, font: "Inter Variable", fontScale: 1, fontWeight: 400}
 	found := false
-	var settings struct {
+	var settings *struct {
 		PopupTransparency          *float64 `json:"popupTransparency"`
 		FloatingWindowSyncGlobal   *bool    `json:"floatingWindowSyncGlobal"`
 		FloatingWindowTransparency *float64 `json:"floatingWindowTransparency"`
@@ -33,8 +34,9 @@ func loadDMSStyle(configDir, cacheDir string) *dmsStyle {
 		FontScale                  float32  `json:"fontScale"`
 		FontWeight                 int      `json:"fontWeight"`
 	}
-	if data, err := os.ReadFile(filepath.Join(configDir, "DankMaterialShell", "settings.json")); err == nil && json.Unmarshal(data, &settings) == nil {
+	if data, err := os.ReadFile(filepath.Join(configDir, "DankMaterialShell", "settings.json")); err == nil && json.Unmarshal(data, &settings) == nil && settings != nil {
 		found = true
+		style.hasSettings = true
 		alpha := settings.PopupTransparency
 		if settings.FloatingWindowSyncGlobal != nil && !*settings.FloatingWindowSyncGlobal {
 			alpha = settings.FloatingWindowTransparency
@@ -72,8 +74,10 @@ func loadDMSStyle(configDir, cacheDir string) *dmsStyle {
 }
 
 func (s *dmsStyle) apply(theme *ui.Theme) {
-	theme.Radius, theme.Font = s.radius, s.font
-	theme.FontSize, theme.Spacing = 14*s.fontScale, 4*s.fontScale
+	if s.hasSettings {
+		theme.Radius, theme.Font = s.radius, s.font
+		theme.FontSize, theme.Spacing = 14*s.fontScale, 4*s.fontScale
+	}
 	for _, entry := range []struct {
 		key   string
 		color *ui.Color
@@ -94,6 +98,9 @@ func (s *dmsStyle) apply(theme *ui.Theme) {
 			*entry.color = ui.Hex(value)
 		}
 	}
+	// DMS Theme.qml uses #FF9800 for warning; normal text needs a darker
+	// variant on a light card (selected by warningColor at render time).
+	theme.Warning = ui.Hex("#FF9800")
 	// DankButton state layers use the label color at 12% hover / 20% press.
 	theme.SurfaceHover = theme.Surface.Mix(theme.Text, 0.12)
 	theme.SurfacePressed = theme.Surface.Mix(theme.Text, 0.20)
