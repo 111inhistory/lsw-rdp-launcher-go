@@ -90,10 +90,10 @@ func (d *dialog) view(c *ui.Context) {
 			ui.Column(c).FillWidth().Padding(12 * scale).Gap(8 * scale).Radius(theme.Radius).Background(theme.Surface).Children(func() {
 				if a.CanLogoff() {
 					ui.Text(c, "窗口 "+count(a.Windows)+" · 托盘 "+count(a.TrayIcons)).TextColor(theme.TextMuted)
+					ui.Text(c, "注销将关闭所有应用，未保存的内容会丢失。").TextColor(warningColor(&theme))
 				} else {
 					ui.Text(c, "无法确认当前会话，仅支持保留切换。").TextColor(theme.TextMuted)
 				}
-				ui.Text(c, "注销将关闭所有应用，未保存的内容会丢失。").TextColor(warningColor(&theme))
 			})
 		})
 		ui.Row(c).Gap(12 * scale).Justify(ui.End).Children(func() {

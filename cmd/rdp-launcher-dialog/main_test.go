@@ -81,10 +81,13 @@ func TestUnknownSessionCannotBeLoggedOff(t *testing.T) {
 	if !tt.HasText("无法确认当前会话，仅支持保留切换。") {
 		t.Fatal(tt.Texts())
 	}
+	if tt.HasText("注销将关闭所有应用，未保存的内容会丢失。") {
+		t.Fatal("warning shown for an unavailable action")
+	}
 }
 
 func TestCancelFocusAndLogoffWarningAreVisible(t *testing.T) {
-	d := &dialog{prompt: controller.SwitchPrompt{TargetMode: "desktop"}, decision: controller.SwitchCancel}
+	d := &dialog{prompt: controller.SwitchPrompt{TargetMode: "desktop", Activity: controller.SessionActivity{SessionID: 2, User: "user", Fingerprint: "logon"}}, decision: controller.SwitchCancel}
 	tt := ui.NewTester(d.view, 480, 220)
 	tt.Frame()
 	if !tt.Focused("取消") {
