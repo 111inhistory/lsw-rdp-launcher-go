@@ -216,10 +216,24 @@ func (m *machine) vmSource(ready bool) {
 		m.vmSubscription = subscriptionLost
 		m.vm(VMUnknown)
 		m.needQuery = false // No snapshot before the replacement subscription ACK.
+		if m.busy != nil && m.busy.accepted {
+			m.confirmationLost(m.busy)
+		}
 		return
 	}
 	m.vmSubscription = subscriptionNeedsSnapshot
 	m.needQuery = true // Missed lifecycle events cannot be replayed.
+}
+
+// The command was accepted, but its confirmation stream no longer exists.
+// Fail only its caller; later FIFO entries can continue after a fresh snapshot.
+func (m *machine) confirmationLost(op *Operation) {
+	m.busy = nil
+	err := fmt.Errorf("%s accepted, but lifecycle source changed; remote outcome unknown", op.Kind)
+	m.state.LastError = err
+	if op.job != nil {
+		m.finish(op.job, Result{Err: err})
+	}
 }
 
 func (m *machine) vm(state VMState) {
@@ -336,7 +350,8 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 		// A caller failure must not disable idle management for the whole VM.
 		// Only failed autonomous work is held to avoid an immediate retry loop.
 		m.autoFailed = op.job == nil
-		// A failed query waits for another request/observation, not a retry loop.
+		// The adapter invalidates this observation connection on query failure.
+		// Wait for its replacement subscription ACK, not another CLI request.
 		if op.Kind == QueryVM {
 			m.needQuery = false
 			for len(m.queue) > 0 {
@@ -363,6 +378,10 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 		// A command acknowledgement is not a VM state observation. Hold this
 		// control slot until the target event arrives (or has already arrived).
 		if m.state.VM != op.targetVM() {
+			if op.revision != m.revision && m.vmSubscription != subscriptionReady {
+				m.confirmationLost(op)
+				return
+			}
 			op.accepted = true
 			op.confirmDeadline = now.Add(m.opts.VMConfirmTimeout)
 			m.busy = op
@@ -427,7 +446,7 @@ func (m *machine) next(now time.Time) *Operation {
 			err := fmt.Errorf("%s accepted, but no %s lifecycle confirmation", op.Kind, op.targetVM())
 			m.busy = nil
 			m.vm(VMUnknown)
-			m.needQuery = false // Another request can query; no automatic polling.
+			m.needQuery = m.vmSubscription == subscriptionNeedsSnapshot
 			m.autoFailed = op.job == nil
 			m.state.LastError = err
 			for len(m.queue) > 0 {
@@ -450,10 +469,11 @@ func (m *machine) next(now time.Time) *Operation {
 		head = m.queue[0]
 	}
 	if m.vmSubscription != subscriptionLost && m.needQuery {
-		return m.begin(QueryVM, head)
+		// A snapshot serves the whole controller, not the current caller.
+		return m.begin(QueryVM, nil)
 	}
 	if m.vmSubscription == subscriptionNeedsSnapshot {
-		return nil // A failed refresh waits for a new request/observation, not a spin loop.
+		return nil // A failed refresh waits for the adapter's replacement ACK.
 	}
 	if m.memory.phase != memoryIdle {
 		if m.memorySourceLost {

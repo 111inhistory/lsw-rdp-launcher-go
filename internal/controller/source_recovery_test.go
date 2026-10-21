@@ -21,7 +21,7 @@ func TestVMLossWaitsForSubscriptionThenQueriesMissingState(t *testing.T) {
 	expectOp(t, m, epoch, WakeVM)
 }
 
-func TestFailedReconnectSnapshotWaitsForExplicitRetry(t *testing.T) {
+func TestFailedReconnectSnapshotWaitsForReplacementSubscription(t *testing.T) {
 	m := testMachine()
 	m.vmSource(false)
 	m.vmSource(true)
@@ -29,7 +29,10 @@ func TestFailedReconnectSnapshotWaitsForExplicitRetry(t *testing.T) {
 	m.done(query.ID, Outcome{Err: errors.New("snapshot RPC failed")}, epoch)
 	expectIdle(t, m, epoch)
 	expectIdle(t, m, epoch)
-	addJob(m, "ping", BackendOnly)
+	// The adapter closes the failed observation attempt; its retrySource
+	// supplies a new ACK. No caller request is needed to resume observation.
+	m.vmSource(false)
+	m.vmSource(true)
 	expectOp(t, m, epoch, QueryVM)
 }
 

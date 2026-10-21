@@ -76,3 +76,16 @@
 后续已在真实 Win11 上运行 `windows-agent/tests/token-acl.ps1 -RunAsAdministrator -InteractiveUser rdp-user`，补齐 ACL 验收：指定用户账户读取通过、SYSTEM 任务读取及 SHA-256 比对通过、正确 ACL 校验通过、宽泛 Users 授权及 DENY ACE 被拒绝。测试只使用临时目录／任务，并在 finally 中清理；没有替换生产 token、agent、服务或注销会话。首次实测发现的是测试 fixture 问题：读权限 DENY 会提前阻止读取，SYSTEM 输出文件没有继承调用者权限；已改为可读的 WriteData DENY 以验证显式拒绝分支，并让临时结果继承受限 ACL、原子发布。不能用 Rust token 比较单测代替这一实机验收。
 
 宿主控制器所有权使用持久 `socket.lock`，应用同步使用缓存目录的 `.sync.lock`；这两者是不同资源的单写者约束，不是 Windows 会话归属管理器。不创建 PID 文件。
+
+### 后续复核补正
+
+先提交基线 `bf4a704`，再修复以下问题，保留可审查的 diff：
+
+- 已接受的 WakeVM／SuspendVM 在 lifecycle 来源丢失时立即释放确认槽。只向关联调用者报告结果未知，不完成后续 FIFO 请求，也不重放旧命令。若断线发生在 RPC 返回前，迟到的接受结果同样不能等待旧来源确认。确认超时仍保留已确认新订阅所要求的补查。
+- QueryVM 失败关闭该次仍有效的 lifecycle 来源，由 Watch 报告 Ready:false 并进入既有退避循环；新订阅确认后再次补查，无需 CLI 请求。旧查询失败不能关闭已经替换的新来源。`TestFailedSnapshotsReconnectWithoutRequests` 使用实际控制器与来源循环，连续失败两次后恢复，检查订阅次数及退避耗时。
+- RemoteApp token 文件路径拒绝所有 Unicode 空白、逗号和双引号，不再生成嵌套引号。没有声称带空格路径已通过 FreeRDP／Windows 实测。
+- 实测 desktop-file-edit 要求 `.desktop` 后缀，因此保留它；在 `.sync.lock` 持有期间先清理 `.rdp-launcher-go-stage-*.desktop` 残留。测试覆盖未持锁不能清理、持锁后清理及其他命名空间保留。
+
+对应缺陷回归已在独立工作树的 `bf4a704` 上确认失败，修复后通过。关键恢复与清理用例另以 `-race -count=20` 重复验证。此次不需要部署、操作 VM 或改变 Windows 会话。
+
+后续取消隔离修复：QueryVM 改为 `begin(QueryVM, nil)`，由控制器生命周期及原有 15 秒查询时限管理，不再随队头调用者取消。显式操作取消不使 libvirt 来源失效；查询超时仍按观测失败重建来源，避免重新引入永久 Unknown。新增端到端回归以真实控制器和来源循环验证 A、B 排队，A 查询期间断开后，B 正常完成，查询与订阅均只有一次且来源未被关闭；该用例修复前复现失败，修复后以 `-race -count=100` 通过。显式构建 commit 也不再混入本地 checkout 的 dirty 状态。

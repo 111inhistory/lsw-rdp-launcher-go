@@ -122,9 +122,36 @@ func OpenLibvirt(ctx context.Context, socket, uri, domain string) (*Libvirt, err
 	return v, nil
 }
 
-// Each control operation owns its connection. Canceling its RPC does not close
-// the independent lifecycle stream or leave a hidden RPC running in a goroutine.
-func (v *Libvirt) Execute(ctx context.Context, op controller.Operation) controller.Outcome {
+// Mutation RPCs own independent connections and never reset the lifecycle
+// stream. A failed QueryVM instead invalidates its observation attempt so Watch
+// retries the subscription and snapshot together, without replaying mutations.
+func (v *Libvirt) Execute(ctx context.Context, op controller.Operation) (out controller.Outcome) {
+	if op.Kind == controller.QueryVM {
+		v.mu.Lock()
+		source := v.current
+		if source == nil {
+			source = v.initial
+		}
+		v.mu.Unlock()
+		defer func() {
+			// Explicit cancellation belongs to the operation owner, not the
+			// observation source. A query deadline is still an observation
+			// failure and must recover through the normal source backoff.
+			if out.Err == nil || source == nil || ctx.Err() == context.Canceled {
+				return
+			}
+			v.mu.Lock()
+			current := v.current == source || v.initial == source
+			v.mu.Unlock()
+			if current {
+				// A failed snapshot invalidates this observation attempt. Watch
+				// emits Ready:false and retries with backoff, then ACKs a new
+				// subscription before the controller queries again. Never close
+				// a replacement source for an older query's late failure.
+				source.shutdown()
+			}
+		}()
+	}
 	api, close, err := v.open(ctx)
 	if err != nil {
 		return controller.Outcome{Err: err}

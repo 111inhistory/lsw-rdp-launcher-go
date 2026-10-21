@@ -86,6 +86,17 @@ func (c Config) SyncApps(apps []adapter.App, executable, config, socket string) 
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
+	// desktop-file-edit requires .desktop even for temporary entries. Under
+	// .sync.lock, no live sync owns these leftovers from interrupted writers.
+	abandoned, err := filepath.Glob(filepath.Join(dir, ".rdp-launcher-go-stage-*.desktop"))
+	if err != nil {
+		return err
+	}
+	for _, path := range abandoned {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove abandoned desktop stage: %w", err)
+		}
+	}
 
 	var stagedFiles []string
 	defer func() {

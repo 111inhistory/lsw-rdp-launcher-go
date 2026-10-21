@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/111inhistory/lsw-rdp-launcher-go/internal/controller"
 )
@@ -45,14 +46,11 @@ func (c DisplayConfig) args(endpoint string, desktop bool) ([]string, error) {
 		if c.AgentTokenFile != "" {
 			// FreeRDP starts the interactive daemon on Windows. Pass the token
 			// file path (never the token) so that daemon enforces the same auth.
-			if strings.ContainsAny(c.AgentTokenFile, ",\"\r\n") {
-				return nil, fmt.Errorf("agent token file path contains unsupported delimiters")
+			if strings.ContainsAny(c.AgentTokenFile, ",\"") || strings.IndexFunc(c.AgentTokenFile, unicode.IsSpace) >= 0 {
+				return nil, fmt.Errorf("agent token file path contains whitespace or unsupported delimiters")
 			}
-			tokenFile := c.AgentTokenFile
-			if strings.ContainsAny(tokenFile, " \t") {
-				tokenFile = "\"" + tokenFile + "\""
-			}
-			command += " --auth-token-file " + tokenFile
+			// Do not nest Windows quotes inside FreeRDP's quoted /app value.
+			command += " --auth-token-file " + c.AgentTokenFile
 		}
 		app := fmt.Sprintf("\"program:%s,cmd:%s\"", c.Program, command)
 		args = append(args, "/app:"+app)

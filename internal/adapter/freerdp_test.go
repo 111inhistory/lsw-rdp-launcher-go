@@ -238,15 +238,16 @@ func TestRemoteAppPassesTokenFilePathWithoutSecret(t *testing.T) {
 		t.Fatal("token secret leaked into argv")
 	}
 
-	c.AgentTokenFile = `C:\Program Files\rdp-launcher\agent-token`
-	args, err = c.args("192.0.2.10:49152", false)
-	if err != nil || !strings.Contains(strings.Join(args, " "), `--auth-token-file "C:\Program Files\rdp-launcher\agent-token"`) {
-		t.Fatal(args, err)
-	}
-
-	c.AgentTokenFile = "invalid,path"
-	if _, err = c.args("192.0.2.10:49152", false); err == nil {
-		t.Fatal("accepted ambiguous token file path")
+	for _, path := range []string{
+		`C:\Program Files\rdp-launcher\agent-token`,
+		"C:\\token\tfile", "C:\\token\rfile", "C:\\token\nfile",
+		"C:\\token\u00a0file", "C:\\token\u2003file",
+		"invalid,path", `invalid"path`,
+	} {
+		c.AgentTokenFile = path
+		if _, err = c.args("192.0.2.10:49152", false); err == nil {
+			t.Fatalf("accepted ambiguous token file path %q", path)
+		}
 	}
 
 	c.AgentTokenFile = `C:\ProgramData\rdp-launcher\agent-token`

@@ -10,7 +10,8 @@ agent_service = "rdp-bridge-agent" # Separate keyring service; username is alway
 # allow SYSTEM and the configured interactive Windows user; Administrators may
 # also be present as a trusted machine-admin exception. Use
 # windows-agent/install.ps1 to provision and verify it. Spaces/tabs inside the
-# token are preserved; only CR/LF are rejected.
+# token are preserved; only CR/LF are rejected. This is distinct from the file
+# path: RemoteApp token paths must not contain whitespace, commas, or quotes.
 agent_token_file = 'C:\ProgramData\rdp-launcher\agent-token'
 agent_port = 49152
 backend_port = 49153

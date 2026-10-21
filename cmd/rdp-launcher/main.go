@@ -110,12 +110,14 @@ func validateSecretInput(in io.Reader) (io.Reader, error) {
 func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	flags := flag.NewFlagSet("rdp-launcher", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	showVersion := flags.Bool("version", false, "print version and commit hash without contacting the controller")
 	config := flags.String("config", host.DefaultConfigPath(), "TOML configuration")
 	socket := flags.String("socket", host.DefaultSocket(), "resident controller's Unix socket")
 	timeout := flags.Duration("timeout", 3*time.Minute, "client request timeout; 0 disables it")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, `Usage: rdp-launcher [global flags] COMMAND [command flags] [arguments]
 
+  version                   Print version and commit hash; no controller needed
   serve / watcher           Run the single resident controller
   status                    Local controller snapshot; does not wake the VM
   lock / unlock             Disable / enable automatic VM suspension
@@ -139,12 +141,23 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	args = flags.Args()
+	if *showVersion || (len(args) > 0 && args[0] == "version") {
+		expectedArgs := 1
+		if *showVersion {
+			expectedArgs = 0
+		}
+		if len(args) != expectedArgs {
+			return fmt.Errorf("version takes no arguments or commands")
+		}
+		_, err := fmt.Fprintln(out, versionString())
+		return err
+	}
 	var err error
 	*socket, err = filepath.Abs(*socket)
 	if err != nil {
 		return err
 	}
-	args = flags.Args()
 	if len(args) == 0 {
 		flags.Usage()
 		return flag.ErrHelp
