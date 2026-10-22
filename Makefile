@@ -1,16 +1,23 @@
 GO ?= go
-GUI_GOTOOLCHAIN ?= go1.27.1
+GO_GOTOOLCHAIN ?= go1.27.3
+GUI_GOTOOLCHAIN ?= $(GO_GOTOOLCHAIN)
+VERSION ?= $(shell git describe --tags --exact-match HEAD 2>/dev/null || printf dev)
 WINDOWS_TARGET ?= x86_64-pc-windows-gnu
 
-.PHONY: check check-go check-gui check-agent
+.PHONY: build check check-go check-gui check-agent
+
+# Exact release tags supply the CLI version; VCS metadata retains dirty detection.
+build:
+	GOTOOLCHAIN=$(GO_GOTOOLCHAIN) $(GO) build -ldflags "-X main.version=$(VERSION)" -o bin/rdp-launcher ./cmd/rdp-launcher
+	cd cmd/rdp-launcher-dialog && GOTOOLCHAIN=$(GUI_GOTOOLCHAIN) $(GO) build -o ../../bin/rdp-launcher-dialog .
 
 # Root ./... intentionally does not include the independent GUI module.
 check: check-go check-gui check-agent
 
 check-go:
-	$(GO) build ./...
-	$(GO) vet ./...
-	$(GO) test -race ./...
+	GOTOOLCHAIN=$(GO_GOTOOLCHAIN) $(GO) build ./...
+	GOTOOLCHAIN=$(GO_GOTOOLCHAIN) $(GO) vet ./...
+	GOTOOLCHAIN=$(GO_GOTOOLCHAIN) $(GO) test -race ./...
 
 check-gui:
 	cd cmd/rdp-launcher-dialog && GOTOOLCHAIN=$(GUI_GOTOOLCHAIN) $(GO) build -o /dev/null .

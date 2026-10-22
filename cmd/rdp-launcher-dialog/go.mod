@@ -1,6 +1,6 @@
 module github.com/111inhistory/lsw-rdp-launcher-go/cmd/rdp-launcher-dialog
 
-go 1.27.1
+go 1.27.3
 
 require (
 	github.com/111inhistory/lsw-rdp-launcher-go v0.0.0

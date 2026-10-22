@@ -1,6 +1,6 @@
 module github.com/111inhistory/lsw-rdp-launcher-go
 
-go 1.24.0
+go 1.27.3
 
 require (
 	github.com/beevik/etree v1.8.1

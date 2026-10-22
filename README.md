@@ -2,6 +2,12 @@
 
 事件驱动的 Linux 宿主控制器，配合 Rust Windows Agent。架构见 [docs/architecture.md](docs/architecture.md)。
 
+## 构建与版本
+
+主模块和 GUI 统一使用 Go **1.27.3**。`make check` 与 `make build` 显式选择该工具链，即使本机设置了 `GOTOOLCHAIN=local`；不替换系统全局 Go。`make build` 生成 `bin/rdp-launcher` 和 `bin/rdp-launcher-dialog`，在精确 release tag 上自动嵌入版本，其他提交显示 `dev`。例如检出 `v0.1.0` 后执行 `make build`，CLI 显示 `v0.1.0`，同时保留提交号及脏工作区标记。
+
+1.27.3 包含 [GO-2026-6809 / CVE-2026-111943](https://pkg.go.dev/vuln/GO-2026-6809) 的 `crypto/x509` 中间 CA 拒绝信任修复；另一受支持分支的修复版本为 1.26.10。参见 [Go 官方发布记录](https://go.dev/doc/devel/release#go1.27.3)。这不是系统 CA 包升级，也不会替代外部 FreeRDP 的 TLS／证书策略。
+
 ## 当前实现
 
 - `internal/controller/`：主循环、FIFO、后台/交互两种就绪条件、VM 控制确认、空闲 deadline、lock/unlock。
@@ -14,7 +20,7 @@
 ## CLI
 
 ```sh
-go build -o rdp-launcher ./cmd/rdp-launcher
+GOTOOLCHAIN=go1.27.3 go build -o rdp-launcher ./cmd/rdp-launcher
 mkdir -p ~/.config/rdp-launcher-go
 cp -n config.example.toml ~/.config/rdp-launcher-go/config.toml
 # 修改 guest IP、用户、程序位置等配置；Windows 后台必须已启动。
