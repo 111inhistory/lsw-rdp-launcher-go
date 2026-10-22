@@ -134,7 +134,7 @@ func main() {
 			configDir, _ := os.UserConfigDir()
 			cacheDir, _ := os.UserCacheDir()
 			if configDir != "" && cacheDir != "" {
-				d.style = loadDMSStyle(configDir, cacheDir)
+				d.style = loadActiveDMSStyle(configDir, cacheDir, os.Getenv("XDG_RUNTIME_DIR"), os.Getenv("WAYLAND_DISPLAY"))
 			}
 		}
 		width, height := int(480*d.scale()), int(220*d.scale())

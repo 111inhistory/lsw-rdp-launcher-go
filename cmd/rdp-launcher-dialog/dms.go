@@ -3,9 +3,12 @@ package main
 import (
 	"encoding/json"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -20,6 +23,60 @@ type dmsStyle struct {
 	font        string
 	fontScale   float32
 	fontWeight  int
+}
+
+// A stopped shell can leave both its theme cache and runtime files behind.
+// Only use DMS styling when its session matches this display and is reachable.
+func loadActiveDMSStyle(configDir, cacheDir, runtimeDir, display string) *dmsStyle {
+	if !dmsRunning(runtimeDir, display) {
+		return nil
+	}
+	return loadDMSStyle(configDir, cacheDir)
+}
+
+func dmsRunning(runtimeDir, display string) bool {
+	if runtimeDir == "" || display == "" {
+		return false
+	}
+	files, err := filepath.Glob(filepath.Join(runtimeDir, "dms-*.session"))
+	if err != nil {
+		return false
+	}
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for _, sessionFile := range files {
+		if time.Until(deadline) <= 0 {
+			return false
+		}
+		data, err := os.ReadFile(sessionFile)
+		if err != nil || strings.TrimSpace(string(data)) != display {
+			continue
+		}
+		base := strings.TrimSuffix(sessionFile, ".session")
+		parent := strings.TrimPrefix(filepath.Base(base), "dms-")
+		data, err = os.ReadFile(base + ".pid")
+		if err != nil || !dmsProcessAlive(parent) || !dmsProcessAlive(strings.TrimSpace(string(data))) {
+			continue
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		conn, err := net.DialTimeout("unix", base+".sock", remaining)
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
+	}
+	return false
+}
+
+func dmsProcessAlive(value string) bool {
+	pid, err := strconv.Atoi(value)
+	if err != nil || pid <= 0 {
+		return false
+	}
+	info, err := os.Stat(filepath.Join("/proc", strconv.Itoa(pid)))
+	return err == nil && info.IsDir()
 }
 
 func loadDMSStyle(configDir, cacheDir string) *dmsStyle {
