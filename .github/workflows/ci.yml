@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Optional ref to check (for example v0.1.0); empty uses the selected ref"
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux CLI and native GUI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0 # make build resolves exact release tags.
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            cmd/rdp-launcher-dialog/go.sum
+
+      - name: Install desktop serializer and native GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y desktop-file-utils fonts-noto-cjk libgtk-3-0t64
+
+      - name: Check Go formatting
+        shell: bash
+        run: |
+          mapfile -d '' files < <(git ls-files -z '*.go')
+          unformatted="$(gofmt -l "${files[@]}")"
+          if [[ -n "$unformatted" ]]; then
+            printf 'Run gofmt on:\n%s\n' "$unformatted"
+            exit 1
+          fi
+
+      # GUI tests use the headless tester, not a compositor or a Windows VM.
+      - name: Check main Go module
+        run: make check-go
+
+      - name: Check independent GUI module
+        run: make check-gui
+
+      - name: Build CLI and GUI
+        run: |
+          make build
+          ./bin/rdp-launcher version
+          git diff --exit-code
+
+      - name: Package Linux binaries
+        run: |
+          tar -czf rdp-launcher-linux-amd64.tar.gz \
+            -C bin rdp-launcher rdp-launcher-dialog \
+            -C .. config.example.toml contrib/niri-rdp-launcher.kdl LICENSE
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: linux-amd64
+          path: rdp-launcher-linux-amd64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows agent (native tests)
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Set up stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path windows-agent/Cargo.toml --check
+
+      - name: Lint Windows agent
+        run: cargo clippy --locked --manifest-path windows-agent/Cargo.toml -- -D warnings
+
+      # These are native Windows unit tests, not RDP/VM integration acceptance.
+      - name: Run native Windows tests
+        run: cargo test --locked --manifest-path windows-agent/Cargo.toml
+
+      - name: Build Windows agent
+        run: cargo build --locked --release --manifest-path windows-agent/Cargo.toml
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: windows-amd64
+          path: |
+            windows-agent/target/release/remoteapp-launcher.exe
+            windows-agent/install.ps1
+          if-no-files-found: error
+          retention-days: 14

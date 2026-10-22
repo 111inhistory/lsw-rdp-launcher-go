@@ -8,6 +8,12 @@
 
 1.27.3 包含 [GO-2026-6809 / CVE-2026-111943](https://pkg.go.dev/vuln/GO-2026-6809) 的 `crypto/x509` 中间 CA 拒绝信任修复；另一受支持分支的修复版本为 1.26.10。参见 [Go 官方发布记录](https://go.dev/doc/devel/release#go1.27.3)。这不是系统 CA 包升级，也不会替代外部 FreeRDP 的 TLS／证书策略。
 
+## GitHub Actions
+
+`.github/workflows/ci.yml` 在 push、PR、`v*` tag 和手动运行时检查代码。Linux 检查主模块、独立 GUI 模块并打包二进制；Windows 原生运行 agent 的 clippy、单测和 release 构建。Actions artifact 保留 14 天，CI 不自动部署、不写入 GitHub Release，也不使用生产 token 或 VM。
+
+手动运行可填写 `ref`（例如 `v0.1.0`），用于验证早于工作流文件的已有 tag。Windows runner 单测不等于 RemoteApp／桌面切换或完整冷启动验收。
+
 ## 当前实现
 
 - `internal/controller/`：主循环、FIFO、后台/交互两种就绪条件、VM 控制确认、空闲 deadline、lock/unlock。
