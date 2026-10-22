@@ -128,6 +128,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
   open [--app TARGET] FILE...
   apps                      Query Windows applications plus configured [[apps]]
   sync-apps                 Cache applications, icons and .desktop entries
+  install-shortcuts         Install Windows desktop and cached app shortcuts locally
   list-apps                 List cached and configured applications; no VM wake
   mounts                    Query the interactive user's mapped drives
   path [--to-linux] PATH    Convert using explicit [mounts] mappings
@@ -252,6 +253,30 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 			return print(map[string]int{"applications": len(c.Catalog(response.Apps))})
 		}
 		return print(data)
+	case "install-shortcuts":
+		if len(args) != 0 {
+			return fmt.Errorf("install-shortcuts takes no arguments")
+		}
+		c, err := host.LoadConfig(*config)
+		if err != nil {
+			return err
+		}
+		apps, err := host.ReadApps()
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		executable, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		path, err := filepath.Abs(*config)
+		if err != nil {
+			return err
+		}
+		if err = c.SyncApps(apps, executable, path, *socket); err != nil {
+			return err
+		}
+		return print(map[string]string{"status": "ok", "desktop": "Windows 桌面"})
 	case "list-apps":
 		c, err := host.LoadConfig(*config)
 		if err != nil {

@@ -15,6 +15,30 @@ import (
 	"github.com/111inhistory/lsw-rdp-launcher-go/internal/host"
 )
 
+func TestInstallShortcutsWithoutControllerOrGuest(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(root, "data"))
+	config := filepath.Join(root, "config.toml")
+	if err := os.WriteFile(config, []byte("# Local-only installation fixture\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out, stderr bytes.Buffer
+	args := []string{"--config", config, "--socket", filepath.Join(root, "absent.sock"), "install-shortcuts"}
+	if err := run(context.Background(), args, &out, &stderr); err != nil {
+		t.Fatal(err, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "data", "applications", "rdp-launcher-go.desktop")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Windows 桌面") {
+		t.Fatal(out.String())
+	}
+	if err := run(context.Background(), append(args, "unexpected"), &out, &stderr); err == nil {
+		t.Fatal("unexpected argument accepted")
+	}
+}
+
 func TestApplicationAndDesktopCLIRequests(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

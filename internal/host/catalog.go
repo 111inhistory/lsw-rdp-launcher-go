@@ -187,6 +187,21 @@ func (c Config) SyncApps(apps []adapter.App, executable, config, socket string) 
 		stagedDesktopsMap[targetDesktop] = stagedDesktop
 	}
 
+	// The built-in desktop connection is a host feature, not a discovered app.
+	// Its filename cannot collide with per-app IDs (including an ID "desktop").
+	desktopTarget := filepath.Join(dir, "rdp-launcher-go.desktop")
+	desktopStage, err := stageDesktopEntry(dir, map[string]string{
+		"Name": "Windows 桌面", "Comment": "连接 Windows 完整桌面",
+		"Exec": desktopQuote(executable) + " --config " + desktopQuote(config) + " --socket " + desktopQuote(socket) + " desktop",
+		"Icon": "computer", "Categories": "Network;RemoteAccess;",
+	})
+	if err != nil {
+		return err
+	}
+	stagedFiles = append(stagedFiles, desktopStage)
+	stagedDesktopTargets = append(stagedDesktopTargets, desktopTarget)
+	stagedDesktopsMap[desktopTarget] = desktopStage
+
 	var published []backupRecord
 
 	// Publish icons

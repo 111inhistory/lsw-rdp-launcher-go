@@ -68,6 +68,8 @@ cp -n config.example.toml ~/.config/rdp-launcher-go/config.toml
 
 `sync-apps` 需要 `desktop-file-utils`（提供 `desktop-file-edit`）；桌面文件的键值序列化交给其 GLib 实现，不复用 shell 或 INI 转义。`[freerdp].app_id` 指定 Niri 观察的客户端标识，默认是 `com.freerdp.client.sdl3`；其他 FreeRDP 客户端应填自己的实际 App ID。该配置只影响观察，不改客户端的窗口角色。可选 `[freerdp.env]` 表用于给 FreeRDP 子进程设置字符串环境变量，例如 `SDL_RENDER_DRIVER = "opengl"`。优先级为继承环境 < `video_driver` < 显式 env；空字符串保留，不做 shell 展开，不修改控制器环境。默认仍过滤继承的代理变量，显式 env 可主动设置代理。环境变量不适合存放凭据（配置及 `show-config` 可见）；RDP 密码仍只经 stdin 传入。修改配置后需重启控制器，下一次启动 FreeRDP 时使用新值。
 
+内置“Windows 桌面”入口由 `rdp-launcher install-shortcuts` 安装，并在 `sync-apps` 时自动维护。该命令只使用本地配置和缓存，不连接控制器、不唤醒 VM；同时重建已缓存的应用入口。固定入口为 `$XDG_DATA_HOME/applications/rdp-launcher-go.desktop`（默认 `~/.local/share/applications/`），执行 `rdp-launcher desktop`，复用安全模式切换，不直接调用 FreeRDP。它不作为远端应用写入缓存，也不受远端应用过滤影响。
+
 应用缓存位于 `$XDG_CACHE_HOME/rdp-launcher-go`，桌面入口位于 `$XDG_DATA_HOME/applications`；未设 XDG 变量时遵循用户目录默认值。同步持有缓存目录的 `.sync.lock`，先准备图标及桌面文件，成功发布后最后提交原始缓存；正常发布失败会尝试回滚并报告回滚失败。持有同步锁时也清理崩溃残留的 `.rdp-launcher-go-stage-*.desktop`（序列化工具要求此后缀）。只清理自身 `rdp-launcher-go-` 桌面文件及未引用 PNG，不宣称跨目录的崩溃事务原子性。支持配置中的 MIME/分类 overrides。Linux 文件通过显式 `[mounts]` 转成 Windows 路径；`mounts` 只查询，不创建共享或修改映射。
 
 ### 全屏桌面模式
