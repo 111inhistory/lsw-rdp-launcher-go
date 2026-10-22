@@ -134,7 +134,7 @@ func handle(ctx context.Context, conn net.Conn, c *controller.Controller, shutdo
 func Call(ctx context.Context, socket string, request Request) (json.RawMessage, error) {
 	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socket)
 	if err != nil {
-		return nil, fmt.Errorf("connect controller (start serve first): %w", err)
+		return nil, fmt.Errorf("connect controller (run rdp-launcher start first): %w", err)
 	}
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })

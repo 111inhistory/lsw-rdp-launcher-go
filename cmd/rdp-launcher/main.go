@@ -115,11 +115,13 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	socket := flags.String("socket", host.DefaultSocket(), "resident controller's Unix socket")
 	timeout := flags.Duration("timeout", 3*time.Minute, "client request timeout; 0 disables it")
 	flags.Usage = func() {
+		fmt.Fprintln(stderr, versionString())
 		fmt.Fprintln(stderr, `Usage: rdp-launcher [global flags] COMMAND [command flags] [arguments]
 
   version                   Print version and commit hash; no controller needed
-  serve / watcher           Run the single resident controller
-  status                    Local controller snapshot; does not wake the VM
+  start                     Start the user service in the background; return when ready
+  serve / watcher           Run the controller in the foreground (debugging)
+  status [--json]            Human-readable status and version; does not wake the VM
   lock / unlock             Disable / enable automatic VM suspension
   shutdown                  Stop the controller and its owned FreeRDP process
   ping                      Backend request; wakes the VM without starting RDP
@@ -164,6 +166,13 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 		return flag.ErrHelp
 	}
 	command, args := args[0], args[1:]
+	if command == "help" {
+		if len(args) != 0 {
+			return fmt.Errorf("help takes no arguments")
+		}
+		flags.Usage()
+		return nil
+	}
 	if command == "serve" || command == "watcher" {
 		if len(args) != 0 {
 			return fmt.Errorf("serve takes no positional arguments")
@@ -189,7 +198,35 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 		return call(host.Request{Action: "request", Request: request})
 	}
 	switch command {
-	case "status", "lock", "unlock", "shutdown":
+	case "start":
+		if len(args) != 0 {
+			return fmt.Errorf("start takes no arguments")
+		}
+		return startHost(ctx, *config, *socket, out)
+	case "status":
+		f := flag.NewFlagSet("status", flag.ContinueOnError)
+		f.SetOutput(stderr)
+		asJSON := f.Bool("json", false, "print machine-readable status, including the CLI version")
+		f.Usage = func() {
+			fmt.Fprintln(stderr, versionString())
+			fmt.Fprintln(stderr, "Usage: rdp-launcher status [--json]")
+			f.PrintDefaults()
+		}
+		if err := f.Parse(args); err != nil {
+			return err
+		}
+		if f.NArg() != 0 {
+			return fmt.Errorf("status takes no positional arguments")
+		}
+		data, err := call(host.Request{Action: "status"})
+		if err != nil {
+			if !*asJSON {
+				fmt.Fprintln(out, versionString())
+			}
+			return err
+		}
+		return printStatus(out, data, *asJSON)
+	case "lock", "unlock", "shutdown":
 		if len(args) != 0 {
 			return fmt.Errorf("%s takes no arguments", command)
 		}

@@ -20,7 +20,7 @@ cp -n config.example.toml ~/.config/rdp-launcher-go/config.toml
 # 修改 guest IP、用户、程序位置等配置；Windows 后台必须已启动。
 ./rdp-launcher auth check       # RDP 密码；没有时用 auth set。
 ./rdp-launcher auth agent check # 共享 agent token；没有时用 auth agent set。
-./rdp-launcher serve            # 前台常驻；其他终端通过同一个 Unix socket 提交请求。
+./rdp-launcher start            # 用户级 systemd 后台启动，就绪后返回终端。
 ```
 
 ```sh
@@ -41,6 +41,8 @@ cp -n config.example.toml ~/.config/rdp-launcher-go/config.toml
 全局 `--config`、`--socket`、`--timeout` 放在命令前；子命令参数放在文件或应用名前。`--timeout 0` 不设客户端时限。`--help` 列出入口。`watcher` 是 `serve` 的别名。
 
 `rdp-launcher version` 或 `rdp-launcher --version` 显示该 CLI 二进制的版本及 commit hash，不读取配置、不连接控制器，也不唤醒 VM。版本默认显示 `dev`，可在构建时指定；不显示带日期的自动伪版本。commit 来自 Go 嵌入的 VCS 信息，取前 8 位，未提交修改标记为 `-dirty`；没有 VCS 信息时显示 `unknown`。发布构建可用 `-ldflags '-X main.version=v0.1.0'` 指定版本；源码包构建还可用 `-X main.commit=<hash>` 指定 commit；显式指定时忽略本地 VCS 的 `dirty` 状态。此命令不代表当前常驻控制器的构建版本。
+
+`rdp-launcher start` 通过用户级 systemd 后台启动控制器，就绪后返回终端，不需要保持 shell。已有控制器（包括手动 `serve`／`watcher`）运行时直接返回，不重启或断开连接。首次启动会创建用户单元，并通过专用 ExecStart drop-in 固定当前可执行文件、配置和 socket；保留已有单元的其他设置，不自动开启登录自启。`serve`／`watcher` 保留作前台调试。`status` 默认显示可读状态及当前 CLI 版本；脚本可用 `status --json`（包含 `Version`）。`help`／`--help` 也显示版本。这些本地状态查询不会唤醒 VM。
 
 控制器在用户运行目录创建权限 0600 的 Unix socket，并在整个 `serve` 生命周期持有同目录 `*.lock` 文件的 `Flock(LOCK_EX|LOCK_NB)` 独占所有权；不写 PID 文件。该 lock 只区分 Linux 控制器所有者，不是 Windows 会话锁；多个 CLI 共用同一个控制器和 FIFO。客户端退出会取消其未完成请求，不重放 run/open。Keyring 使用 `secret-tool`，凭据不写入 TOML，不进入 CLI argv 或 Linux 控制 socket；agent token 仅附加在受控网络的 Windows 请求 envelope 中。
 
@@ -87,7 +89,7 @@ rdp-launcher remoteapp   # 检查旧图形会话，再连接 RemoteApp。
 
 Windows Session ID 只用于定位目标；后台同时校验用户与登录指纹，拒绝 session 0、已变化的登录和不明确的目标。自动注销前再次确认窗口和托盘均为零；未知不等于零。Shell 托盘枚举是可选能力，RemoteApp 壳不能可靠枚举时会显示“未知”并要求确认，不会假定没有托盘。不存在可唯一确定的用户会话时，“注销并切换”不可用。图形会话中的无窗口应用也会随注销结束；SSH／服务会话独立观察，不作为本操作的注销目标。
 
-桌面连接存在时不会因 RemoteApp 窗口计数为零而自动断开或暂停 VM。退出后仍使用原空闲策略。`status` 的 `DisplayMode` 显示 `desktop` 或 `remoteapp`。RemoteApp 就绪需要交互 agent 所在会话已激活；旧的断开会话里仍存活的 agent 不算新连接就绪。
+桌面连接存在时不会因 RemoteApp 窗口计数为零而自动断开或暂停 VM。退出后仍使用原空闲策略。`status` 的“显示”行显示 `desktop` 或 `remoteapp`（`status --json` 中为 `DisplayMode`）。RemoteApp 就绪需要交互 agent 所在会话已激活；旧的断开会话里仍存活的 agent 不算新连接就绪。
 
 `run/open/apps/sync-apps/mounts` 仍使用 RemoteApp 和交互 agent；桌面连接存在时会明确报模式冲突。先用 `remoteapp` 切换，再执行这些命令。后台请求仍可运行。
 
