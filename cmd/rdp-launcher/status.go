@@ -56,7 +56,14 @@ func printStatus(out io.Writer, data json.RawMessage) error {
 	if s.Windows >= 0 {
 		windows = fmt.Sprint(s.Windows)
 	}
-	fmt.Fprintf(&text, "显示：%s\n窗口：%s\nSSH：%s\n自动回收：%s\n队列：%d\n", display, windows, s.SSH, yesNo(s.Locked, "禁用（已锁定）", "启用"), s.Queued)
+	ssh := "未知"
+	switch controller.SSHState(s.SSH) {
+	case controller.SSHZero:
+		ssh = "0"
+	case controller.SSHActive:
+		ssh = ">0"
+	}
+	fmt.Fprintf(&text, "显示：%s\n窗口：%s\nSSH：%s\n自动回收：%s\n队列：%d\n", display, windows, ssh, yesNo(s.Locked, "禁用（已锁定）", "启用"), s.Queued)
 	if s.Binding == nil {
 		fmt.Fprintln(&text, "绑定会话：无")
 	} else {
@@ -68,11 +75,13 @@ func printStatus(out io.Writer, data json.RawMessage) error {
 	}
 	switch {
 	case s.Sessions.Revision == 0:
-		fmt.Fprintln(&text, "会话快照：未获取")
+		fmt.Fprintln(&text, "登录信息：未获取")
 	case s.Sessions.Fresh:
-		fmt.Fprintf(&text, "会话快照：新鲜（修订 %d，%d 个登录）\n", s.Sessions.Revision, len(s.Sessions.Sessions))
+		fmt.Fprintf(&text, "登录信息：已更新（%d 个登录）\n", len(s.Sessions.Sessions))
+	case s.VM == string(controller.VMPaused):
+		fmt.Fprintf(&text, "登录信息：上次记录（%d 个登录，虚拟机已暂停）\n", len(s.Sessions.Sessions))
 	default:
-		fmt.Fprintf(&text, "会话快照：过期（修订 %d，%d 个登录）\n", s.Sessions.Revision, len(s.Sessions.Sessions))
+		fmt.Fprintf(&text, "登录信息：待更新（上次记录 %d 个登录）\n", len(s.Sessions.Sessions))
 	}
 	retained := "未知"
 	if s.RetainedLogins >= 0 {
@@ -91,13 +100,26 @@ func printStatus(out io.Writer, data json.RawMessage) error {
 	if s.AwaitingVM != "" {
 		fmt.Fprintf(&text, "等待虚拟机：%s\n", s.AwaitingVM)
 	}
-	if s.Memory.GuestKnown {
-		fmt.Fprintf(&text, "内存：总量 %.2f GiB，可用 %.2f GiB\n", float64(s.Memory.Guest.TotalBytes)/(1<<30), float64(s.Memory.Guest.AvailableBytes)/(1<<30))
+	// Pausing invalidates live observations, but does not discard their values.
+	// Present those values as records without changing the controller's validity flags.
+	paused := s.VM == string(controller.VMPaused)
+	guestRecorded := paused && !s.Memory.GuestKnown && s.Memory.Guest.TotalBytes > 0 && s.Memory.Guest.AvailableBytes <= s.Memory.Guest.TotalBytes
+	if s.Memory.GuestKnown || guestRecorded {
+		label := "内存"
+		if guestRecorded {
+			label += "（上次记录）"
+		}
+		fmt.Fprintf(&text, "%s：总量 %.2f GiB，可用 %.2f GiB\n", label, float64(s.Memory.Guest.TotalBytes)/(1<<30), float64(s.Memory.Guest.AvailableBytes)/(1<<30))
 	} else {
 		fmt.Fprintln(&text, "内存：未知")
 	}
-	if s.Memory.DeviceKnown {
-		fmt.Fprintf(&text, "virtio-mem：已插入 %.2f GiB，请求 %.2f GiB，容量 %.2f GiB\n", float64(s.Memory.Device.ActualBytes)/(1<<30), float64(s.Memory.Device.RequestedBytes)/(1<<30), float64(s.Memory.Device.CapacityBytes)/(1<<30))
+	deviceRecorded := paused && !s.Memory.DeviceKnown && s.Memory.Device.CapacityBytes > 0
+	if s.Memory.DeviceKnown || deviceRecorded {
+		label := "virtio-mem"
+		if deviceRecorded {
+			label += "（上次记录）"
+		}
+		fmt.Fprintf(&text, "%s：已插入 %.2f GiB，请求 %.2f GiB，容量 %.2f GiB\n", label, float64(s.Memory.Device.ActualBytes)/(1<<30), float64(s.Memory.Device.RequestedBytes)/(1<<30), float64(s.Memory.Device.CapacityBytes)/(1<<30))
 	}
 	var memory []string
 	for _, item := range []struct {

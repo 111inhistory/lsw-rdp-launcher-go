@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/111inhistory/lsw-rdp-launcher-go/internal/controller"
 	"github.com/111inhistory/lsw-rdp-launcher-go/internal/host"
 )
 
@@ -57,7 +58,7 @@ func TestHumanStatusIncludesVersionAndRejectsJSON(t *testing.T) {
 	if err := run(context.Background(), []string{"--socket", socket, "status"}, &out, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{versionString(), "虚拟机：running", "窗口：未知", "显示：已连接（remoteapp）", "8.00 GiB", "2.00 GiB", "source error", "memory error", "扩容", "绑定会话：4 DOMAIN\\user", "会话快照：新鲜", "保留登录：2", "阶段：dispatch", "阻塞原因：session snapshot stale", "空闲注销时间："} {
+	for _, want := range []string{versionString(), "虚拟机：running", "窗口：未知", "显示：已连接（remoteapp）", "8.00 GiB", "2.00 GiB", "source error", "memory error", "扩容", "绑定会话：4 DOMAIN\\user", "SSH：0", "登录信息：已更新（1 个登录）", "保留登录：2", "阶段：dispatch", "阻塞原因：session snapshot stale", "空闲注销时间："} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatal("missing status information", want, out.String())
 		}
@@ -175,7 +176,82 @@ func TestStatusRendersUnknownRetainedLoginsForStaleSnapshot(t *testing.T) {
 	if strings.Contains(out.String(), "保留登录：-1") {
 		t.Fatal("negative retained count leaked into status", out.String())
 	}
-	if !strings.Contains(out.String(), "会话快照：过期") {
-		t.Fatal("stale snapshot was not shown as stale", out.String())
+	if !strings.Contains(out.String(), "登录信息：待更新（上次记录 1 个登录）") {
+		t.Fatal("stale login information was not labelled as a record", out.String())
+	}
+}
+
+func TestStatusUsesReadableSSHAndHidesSnapshotRevision(t *testing.T) {
+	for _, tc := range []struct{ state, want string }{
+		{"zero", "0"}, {"nonzero", ">0"}, {"unknown", "未知"}, {"", "未知"},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			data, err := json.Marshal(statusView{VM: "running", SSH: tc.state, Windows: -1, RetainedLogins: -1,
+				Sessions: controller.SessionSnapshot{Revision: 19, Fresh: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			if err := printStatus(&out, data); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out.String(), "SSH："+tc.want+"\n") {
+				t.Fatal(out.String())
+			}
+			for _, jargon := range []string{"新鲜", "修订", "会话快照"} {
+				if strings.Contains(out.String(), jargon) {
+					t.Fatal("internal terminology leaked", jargon, out.String())
+				}
+			}
+		})
+	}
+}
+
+func TestPausedStatusShowsRecordedValuesWithoutTreatingThemAsCurrent(t *testing.T) {
+	s := statusView{VM: "paused", SSH: "unknown", Windows: -1, RetainedLogins: -1,
+		Sessions: controller.SessionSnapshot{Revision: 19, Sessions: []controller.Login{{}}}}
+	s.Memory.Guest = controller.GuestMemory{TotalBytes: 8 << 30, AvailableBytes: 2 << 30}
+	// Zero actual/requested is valid after reclaim; capacity proves this is a
+	// retained full device snapshot, not just an actual-size event.
+	s.Memory.Device = controller.MemoryDevice{CapacityBytes: 13 << 30, BlockBytes: 128 << 20}
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := printStatus(&out, data); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"SSH：未知", "登录信息：上次记录（1 个登录，虚拟机已暂停）", "保留登录：未知",
+		"内存（上次记录）：总量 8.00 GiB，可用 2.00 GiB", "virtio-mem（上次记录）：已插入 0.00 GiB，请求 0.00 GiB，容量 13.00 GiB"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatal("missing paused record", want, out.String())
+		}
+	}
+	for _, vm := range []string{"running", "off"} {
+		s.VM = vm
+		data, _ = json.Marshal(s)
+		out.Reset()
+		if err := printStatus(&out, data); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(out.String(), "GiB") {
+			t.Fatal("invalid memory observation shown outside paused records", out.String())
+		}
+	}
+}
+
+func TestPausedStatusDoesNotInventUnobservedValues(t *testing.T) {
+	var out bytes.Buffer
+	if err := printStatus(&out, json.RawMessage(`{"VM":"paused","SSH":"unknown","RetainedLogins":-1,"Memory":{"Device":{"Alias":"mem0","ActualBytes":1024}}}`)); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"SSH：未知", "登录信息：未获取", "保留登录：未知", "内存：未知"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatal(out.String())
+		}
+	}
+	if strings.Contains(out.String(), "virtio-mem：") || strings.Contains(out.String(), "上次记录") {
+		t.Fatal("incomplete event or unobserved value was shown as a full record", out.String())
 	}
 }
