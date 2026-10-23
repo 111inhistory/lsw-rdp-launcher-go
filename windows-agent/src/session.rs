@@ -289,77 +289,24 @@ fn account_name_from_sid(sid_string: &str) -> io::Result<String> {
     }
 }
 
-fn current_process_identity() -> io::Result<(String, String)> {
-    unsafe {
-        let mut token = ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let token = VerifiedUserToken(token);
-
-        let mut needed = 0u32;
-        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut needed);
-        if needed == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut user = vec![0u8; needed as usize];
-        if GetTokenInformation(
-            token.0,
-            TokenUser,
-            user.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let sid = sid_to_string(
-            ptr::read_unaligned(user.as_ptr() as *const TOKEN_USER)
-                .User
-                .Sid,
-        )?;
-
-        let mut statistics: TOKEN_STATISTICS = mem::zeroed();
-        let mut length = 0u32;
-        if GetTokenInformation(
-            token.0,
-            TokenStatistics,
-            (&mut statistics as *mut TOKEN_STATISTICS).cast(),
-            mem::size_of::<TOKEN_STATISTICS>() as u32,
-            &mut length,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let authentication_id = format_authentication_id(
-            statistics.AuthenticationId.HighPart,
-            statistics.AuthenticationId.LowPart,
-        );
-        Ok((sid, authentication_id))
-    }
-}
-
-fn current_session_id() -> io::Result<u32> {
-    let mut session_id = 0u32;
-    if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) } == 0 {
+/// Read the worker's own complete logon identity from its process token. The
+/// SYSTEM backend already verified the token used to spawn this worker.
+pub fn current_worker_identity() -> io::Result<(SessionRef, String)> {
+    let mut raw_token = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(session_id)
-}
-
-/// Read the worker's own complete logon identity. The SYSTEM backend already
-/// verified the target session before spawning, so this only reports the
-/// session the worker actually landed in.
-pub fn current_worker_identity() -> io::Result<(SessionRef, String)> {
-    let session_id = current_session_id()?;
-    let (sid, authentication_id) = current_process_identity()?;
+    let token = VerifiedUserToken(raw_token);
+    let identity = inspect_token_handle(token.0)?;
     let reference = SessionRef {
-        session_id,
-        authentication_id,
+        session_id: identity.session_id,
+        authentication_id: identity
+            .authentication_id
+            .ok_or_else(|| io::Error::other("user worker logon identity is unavailable"))?,
         boot_identifier: boot_identifier()?,
     };
     reference.validate().map_err(io::Error::other)?;
-    Ok((reference, sid))
+    Ok((reference, identity.sid))
 }
 
 /// Report the worker's actual execution session and reference as observed
@@ -628,13 +575,6 @@ pub fn open_verified_user_token(
 ) -> io::Result<VerifiedUserToken> {
     reference.validate().map_err(io::Error::other)?;
     let boot = boot_identifier()?;
-    if !session_present(reference.session_id)? {
-        return Err(io::Error::other("target session no longer exists"));
-    }
-    let raw = raw_session(reference.session_id)?;
-    if raw.user.is_empty() {
-        return Err(io::Error::other("target session has no logged-on user"));
-    }
     let token = open_session_token(reference.session_id)?;
     let identity = inspect_token_handle(token.0)?;
     verify_worker_identity(
@@ -1098,6 +1038,25 @@ async fn refresh_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_inspection_reads_current_process_identity() {
+        let mut raw_token = ptr::null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) },
+            0
+        );
+        let token = VerifiedUserToken(raw_token);
+        let identity = inspect_token_handle(token.0).unwrap();
+        let mut session_id = 0u32;
+        assert_ne!(
+            unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) },
+            0
+        );
+        assert_eq!(identity.session_id, session_id);
+        assert!(identity.sid.starts_with("S-1-"));
+        assert!(identity.authentication_id.is_some());
+    }
 
     #[test]
     fn access_requires_both_configured_host_and_user() {

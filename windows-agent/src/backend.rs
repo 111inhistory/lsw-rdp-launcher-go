@@ -12,8 +12,8 @@ use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use crate::protocol::{
-    check_protocol, verify_worker_identity, ErrorResponse, HostAction, Snapshot, WorkerRequest,
-    WorkerResponse, PROTOCOL, ROLE_BACKGROUND, ROLE_USER,
+    check_protocol, ErrorResponse, HostAction, Snapshot, WorkerRequest, WorkerResponse, PROTOCOL,
+    ROLE_BACKGROUND, ROLE_USER,
 };
 use crate::{auth, memory, session, ssh, worker};
 
@@ -488,8 +488,6 @@ async fn handle(
                 .await;
             }
             let sid = access.sid.clone();
-            let response_sid = sid.clone();
-            let response_reference = session_ref.clone();
             let deadline = Instant::now() + USER_ACTION_WORKER_TIMEOUT;
             let result = tokio::task::spawn_blocking(move || {
                 worker::execute(&session_ref, &sid, WorkerRequest::SessionStatus, deadline)
@@ -507,22 +505,6 @@ async fn handle(
                             .await
                         }
                     };
-                    if let Err(error) = verify_worker_identity(
-                        &response_reference,
-                        &response_sid,
-                        status.reference.session_id,
-                        &status.sid,
-                        Some(&status.reference.authentication_id),
-                        &status.reference.boot_identifier,
-                    ) {
-                        return send_error(
-                            &mut write,
-                            ErrorResponse::protocol(format!(
-                                "user worker identity does not match the verified session_ref: {error}"
-                            )),
-                        )
-                        .await;
-                    }
                     send(&mut write, &user_status_response(status)).await
                 }
                 Ok(Ok(response)) => {
