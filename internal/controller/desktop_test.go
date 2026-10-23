@@ -5,32 +5,41 @@ import (
 	"time"
 )
 
-func TestDesktopDoesNotNeedInteractiveAgentOrWindowIdleTimer(t *testing.T) {
+func TestDesktopStartsWithBackgroundBindingAndNoWindowIdleTimer(t *testing.T) {
 	m := testMachine()
-	m.backend(false, SSHUnknown)
-	addJob(m, "desktop", Desktop)
+	addJob(m, "desktop", ModeDesktop)
 	start := expectOp(t, m, epoch, StartDisplay)
-	m.done(start.ID, Outcome{}, epoch)
+	completeStart(t, m, start, bindingLogin(2))
 	dispatch := expectOp(t, m, epoch, Dispatch)
 	m.done(dispatch.ID, Outcome{Data: "process started"}, epoch)
-	if !m.state.Display || m.state.DisplayMode != "desktop" || m.state.BackendReady {
+	if !m.state.Display || m.state.DisplayMode != ModeDesktop || m.state.Binding == nil {
 		t.Fatal(m.snapshot())
 	}
 	m.windows(0)
 	expectIdle(t, m, epoch)
 	expectIdle(t, m, epoch.Add(10*time.Minute))
 	if !m.state.DisplayDeadline.IsZero() || !m.state.SuspendDeadline.IsZero() {
-		t.Fatal(m.snapshot())
+		t.Fatal("desktop acquired an idle timer", m.snapshot())
 	}
-	// Repeating the request reuses the process rather than starting another RDP
-	// connection. An Interactive request must not assume a desktop started its agent.
-	addJob(m, "desktop", Desktop)
+	// Repeating the same mode reuses the bound connection rather than starting
+	// another RDP process.
+	addJob(m, "desktop", ModeDesktop)
 	dispatch = expectOp(t, m, epoch, Dispatch)
 	m.done(dispatch.ID, Outcome{}, epoch)
-	addJob(m, "run", Interactive)
-	expectIdle(t, m, epoch)
-	if m.completed[len(m.completed)-1].result.Err == nil || m.state.DisplayMode != "desktop" {
-		t.Fatal(m.snapshot(), m.completed)
+	if m.state.DisplayMode != ModeDesktop {
+		t.Fatal(m.snapshot())
+	}
+	// A different mode is a conflict and must not silently replace the desktop.
+	addJob(m, "run", ModeRemoteApp)
+	inspect := expectOp(t, m, epoch, InspectSession)
+	m.done(inspect.ID, Outcome{Sessions: activitySnapshot(bindingLogin(2))}, epoch)
+	if m.state.DisplayMode != ModeDesktop {
+		t.Fatal("old connection changed before consent", m.snapshot())
+	}
+	confirm := expectOp(t, m, epoch, ConfirmSwitch)
+	m.done(confirm.ID, Outcome{Decision: SwitchCancel}, epoch)
+	if !m.state.Display || m.state.DisplayMode != ModeDesktop {
+		t.Fatal("cancel changed the connection", m.snapshot())
 	}
 	m.displayExited(start.ID, nil)
 	if m.state.Display || m.state.DisplayMode != "" {
@@ -38,27 +47,57 @@ func TestDesktopDoesNotNeedInteractiveAgentOrWindowIdleTimer(t *testing.T) {
 	}
 }
 
-func TestDesktopReplacementRequiresExplicitPermission(t *testing.T) {
+func TestDesktopSwitchRequiresConsentAndCancelKeepsOldConnection(t *testing.T) {
 	m := testMachine()
 	old := displayReady(t, m)
-	addJob(m, "desktop", Desktop)
-	expectIdle(t, m, epoch)
-	if len(m.completed) != 1 || m.completed[0].result.Err == nil || m.state.DisplayMode != "remoteapp" {
-		t.Fatal(m.snapshot(), m.completed)
+	addJob(m, "desktop", ModeDesktop)
+	inspect := expectOp(t, m, epoch, InspectSession)
+	if !m.state.Display || m.displayID != old {
+		t.Fatal("old connection changed before inspection")
 	}
-	j := addJob(m, "desktop", Desktop)
-	j.request.SwitchDisplay = true
+	one := uint32(1)
+	login := bindingLogin(2)
+	login.Windows = &one
+	m.done(inspect.ID, Outcome{Sessions: activitySnapshot(login)}, epoch)
+	confirm := expectOp(t, m, epoch, ConfirmSwitch)
+	if confirm.Prompt.Allows(SwitchCurrent) {
+		t.Fatal("current desktop was offered while the bound connection is RemoteApp", confirm.Prompt)
+	}
+	m.done(confirm.ID, Outcome{Decision: SwitchCancel}, epoch)
+	if !m.state.Display || m.displayID != old || m.switching != nil || len(m.queue) != 0 {
+		t.Fatal(m.snapshot())
+	}
+	if len(m.completed) != 1 || m.completed[0].result.Err != nil {
+		t.Fatal(m.completed)
+	}
+}
+
+func TestEmptySessionKeepsLoginWithoutAutomaticLogoff(t *testing.T) {
+	m := testMachine()
+	displayReady(t, m)
+	addJob(m, "desktop", ModeDesktop)
 	inspect := expectOp(t, m, epoch, InspectSession)
 	zero := uint32(0)
-	m.done(inspect.ID, Outcome{Activity: &SessionActivity{Windows: &zero, TrayIcons: &zero}}, epoch)
+	login := bindingLogin(2)
+	login.Windows, login.TrayIcons = &zero, &zero
+	m.done(inspect.ID, Outcome{Sessions: activitySnapshot(login)}, epoch)
 	stop := expectOp(t, m, epoch, StopDisplay)
 	m.done(stop.ID, Outcome{}, epoch)
 	start := expectOp(t, m, epoch, StartDisplay)
-	m.done(start.ID, Outcome{}, epoch)
-	m.displayExited(old, nil)
-	if !m.state.Display || m.state.DisplayMode != "desktop" {
-		t.Fatal(m.snapshot())
-	}
+	completeStart(t, m, start, bindingLogin(3))
 	dispatch := expectOp(t, m, epoch, Dispatch)
 	m.done(dispatch.ID, Outcome{}, epoch)
+	if m.state.DisplayMode != ModeDesktop || m.switching != nil {
+		t.Fatal(m.snapshot())
+	}
+	for _, item := range m.completed {
+		if item.result.Err != nil {
+			t.Fatal(item.result.Err)
+		}
+	}
+}
+
+func activitySnapshot(login Login) *SessionSnapshot {
+	snapshot := sessionSnapshot(login)
+	return &snapshot
 }

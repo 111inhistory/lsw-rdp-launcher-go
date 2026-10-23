@@ -68,7 +68,7 @@
 //!
 //! The GNU Windows build and tests ran on win11. IPv4 and IPv6 zero/non-zero
 //! transitions were observed through ETW in about one second, before the
-//! 60-second fallback. A SYSTEM backend and an interactive RemoteApp process
+//! 60-second fallback. A SYSTEM backend and a RemoteApp shell process
 //! were tested separately. Non-elevated ETW startup is not live-validated.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};

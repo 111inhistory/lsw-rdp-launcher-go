@@ -4,6 +4,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -27,37 +28,41 @@ const (
 	SSHActive  SSHState = "nonzero"
 )
 
-type Requirement uint8
-
 const (
-	BackendOnly Requirement = iota
-	Interactive
-	Desktop
+	ModeRemoteApp = "remoteapp"
+	ModeDesktop   = "desktop"
 )
 
-// The caller classifies the request. The machine does not infer user-session
-// requirements from action names (for example, sync-apps versus mounts).
+// The business payload survives connection changes and a single confirmation.
+// Confirm belongs to the requesting IPC connection, never to a resident GUI.
 type Request struct {
-	Action        string
-	Target        string
-	Params        string
-	WorkingDir    string
-	WithIcons     bool
-	SwitchDisplay bool `json:"-"` // Set only by the checked host switch action.
-	File          string
-	Need          Requirement
+	Action     string                                                      `json:"action"`
+	Target     string                                                      `json:"target,omitempty"`
+	Params     string                                                      `json:"params,omitempty"`
+	WorkingDir string                                                      `json:"working_dir,omitempty"`
+	WithIcons  bool                                                        `json:"with_icons,omitempty"`
+	File       string                                                      `json:"file,omitempty"`
+	Mode       string                                                      `json:"mode,omitempty"`
+	Choice     SwitchDecision                                              `json:"choice,omitempty"`
+	Batch      []Request                                                   `json:"batch,omitempty"`
+	Confirm    func(context.Context, SwitchPrompt) (SwitchDecision, error) `json:"-"`
 }
+
+func (r Request) NeedsUser() bool { return r.Mode != "" }
+
 type Result struct {
 	Data any
 	Err  error
 }
 type job struct {
+	id      uint64
 	request Request
 	ctx     context.Context
 	reply   chan Result
 }
 type Options struct {
 	IdleDisconnect, VMSuspend time.Duration
+	IdleLogoff                time.Duration // -1 disables; zero runs after disconnect.
 	VMConfirmTimeout          time.Duration
 	Memory                    *MemoryPolicy
 }
@@ -78,19 +83,32 @@ const (
 	PrepareMemory  Kind = "prepare-memory"
 )
 
+type OperationSource string
+
+const (
+	SourceUser     OperationSource = "user"
+	SourceIdle     OperationSource = "idle"
+	SourcePressure OperationSource = "pressure"
+	SourceRecovery OperationSource = "recovery"
+)
+
 type Operation struct {
+	Source               OperationSource
+	Reference            SessionRef
 	ID                   uint64
 	Kind                 Kind
 	VM                   VMState
 	Request              Request
 	Activity             SessionActivity
-	RequireEmpty         bool
+	Prompt               SwitchPrompt
 	MemoryTarget         uint64
 	ResumeSafe           bool
 	MemoryPrepared       bool
 	memoryRevision       uint64
 	memorySourceRevision uint64
 	revision             uint64
+	sessionGeneration    uint64
+	idleGeneration       uint64
 	job                  *job
 	displayExited        bool
 	accepted             bool
@@ -105,6 +123,8 @@ func (op *Operation) targetVM() VMState {
 }
 
 type Outcome struct {
+	Sessions       *SessionSnapshot
+	Binding        *Login
 	Activity       *SessionActivity
 	Decision       SwitchDecision
 	VM             VMState // QueryVM snapshot only. WakeVM/SuspendVM success is command acknowledgement.
@@ -127,6 +147,12 @@ type Snapshot struct {
 	AwaitingVM                       VMState
 	DisplayDeadline, SuspendDeadline time.Time
 	LastError                        error
+	Binding                          *Login
+	Sessions                         SessionSnapshot
+	Stage                            string
+	BlockingReason                   string
+	RetainedLogins                   int
+	LogoffDeadline                   time.Time
 	Memory                           MemoryState
 }
 type completion struct {
@@ -151,6 +177,7 @@ type machine struct {
 	busy                        *Operation
 	memoryBusy                  *Operation
 	nextID, revision, displayID uint64
+	nextTaskID                  uint64
 	needQuery                   bool
 	vmSubscription              subscriptionState
 	memorySourceRevision        uint64
@@ -160,6 +187,13 @@ type machine struct {
 	completed                   []completion
 	memory                      memoryControl
 	switching                   *displaySwitch
+	idleSince                   time.Time
+	idleLogoffDone              bool
+	logoffReclaim               bool
+	sessionGeneration           uint64
+	backendStreamGeneration     uint64
+	backendStreamInvalid        bool
+	idleGeneration              uint64
 }
 
 func newMachine(opts Options) *machine {
@@ -177,6 +211,25 @@ func newMachine(opts Options) *machine {
 func (m *machine) snapshot() Snapshot {
 	s := m.state
 	s.Queued = len(m.queue)
+	s.RetainedLogins = len(s.Sessions.Sessions)
+	if !s.Sessions.Fresh {
+		s.RetainedLogins = -1
+	}
+	if s.Binding != nil && s.Display && s.RetainedLogins > 0 {
+		s.RetainedLogins--
+	}
+	if m.switching != nil {
+		s.Stage = fmt.Sprint(m.switching.phase)
+	}
+	if s.Display && s.Binding == nil {
+		s.BlockingReason = "connection is not bound to a logon"
+	}
+	if !s.Sessions.Fresh && s.Binding != nil {
+		s.BlockingReason = "session snapshot is stale"
+	}
+	if s.Locked && m.opts.Memory != nil && s.VM == VMRunning && s.BackendReady && m.memory.GuestKnown && !m.memory.WindowPrepared {
+		s.BlockingReason = "memory initialization requires pause; unlock before preparation"
+	}
 	s.Memory = m.memory.MemoryState
 	s.Memory.Preparing = m.memory.phase != memoryIdle
 	if m.memoryBusy != nil {
@@ -193,6 +246,8 @@ func (m *machine) snapshot() Snapshot {
 	return s
 }
 func (m *machine) enqueue(j *job) {
+	m.nextTaskID++
+	j.id = m.nextTaskID
 	m.queue = append(m.queue, j)
 	m.resetTimers()
 	m.autoFailed = false
@@ -202,8 +257,7 @@ func (m *machine) enqueue(j *job) {
 }
 func (m *machine) lock(locked bool) {
 	m.state.Locked = locked
-	m.state.SuspendDeadline = time.Time{}
-	m.memoryCancelReclaim()
+	m.resetTimers()
 }
 func (m *machine) windows(count int) {
 	if count != m.state.Windows {
@@ -241,6 +295,8 @@ func (m *machine) vm(state VMState) {
 		return
 	}
 	m.revision++
+	m.invalidateSessions()
+	m.backendStreamInvalid = true
 	m.state.VM = state
 	m.needQuery = state == VMUnknown || m.vmSubscription == subscriptionNeedsSnapshot
 	m.resetTimers()
@@ -260,7 +316,9 @@ func (m *machine) vm(state VMState) {
 	if state == VMUnknown && m.memory.phase != memoryIdle {
 		m.memoryAbort(fmt.Errorf("VM state lost during memory preparation"))
 	}
+	m.state.Sessions.Fresh = false
 	if state == VMOff {
+		m.state.Binding = nil
 		m.memory = memoryControl{}
 		if m.memorySourceLost {
 			m.memory.LastError = ErrMemorySourceLost
@@ -276,11 +334,13 @@ func (m *machine) backend(ready bool, ssh SSHState) {
 		return
 	}
 	if m.state.SSH != ssh || m.state.BackendReady != ready {
-		m.state.SuspendDeadline = time.Time{}
+		m.resetTimers()
 	}
 	m.state.BackendReady = ready
 	m.state.SSH = ssh
 	if !ready {
+		m.invalidateSessions()
+		m.backendStreamInvalid = true
 		m.state.SSH = SSHUnknown
 		m.memory.GuestKnown = false
 	}
@@ -305,11 +365,21 @@ func (m *machine) displayExited(id uint64, err error) {
 	}
 }
 func (m *machine) resetTimers() {
+	m.idleGeneration++
 	m.state.DisplayDeadline = time.Time{}
 	m.state.SuspendDeadline = time.Time{}
+	m.state.LogoffDeadline = time.Time{}
+	m.idleSince = time.Time{}
+	m.idleLogoffDone = false
+	m.logoffReclaim = false
+	m.state.BlockingReason = ""
 	m.memoryCancelReclaim()
 }
 func (m *machine) finish(j *job, result Result) {
+	if result.Err != nil {
+		m.state.LastError = result.Err
+	}
+	log.Printf("request complete task=user-%d action=%s error=%v", j.id, j.request.Action, result.Err)
 	// An operation may only complete its own queue head, never the next caller.
 	// A mismatch is an internal invariant violation, not a recoverable RPC error.
 	if len(m.queue) == 0 || m.queue[0] != j {
@@ -339,6 +409,11 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 		return
 	}
 	if out.Err != nil {
+		if op.Source == SourceIdle && (op.Kind == InspectSession || op.Kind == LogoffSession) {
+			m.state.LastError = out.Err
+			m.skipIdleLogoff(out.Err.Error())
+			return
+		}
 		if op.Kind == QueryVM {
 			// Fail queued callers consistently whether source loss or this
 			// result arrived first. Revision only guards observation state.
@@ -362,7 +437,7 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 		if op.Kind == QueryVM {
 			m.needQuery = false
 		} else if op.job != nil {
-			m.finish(op.job, Result{Err: out.Err})
+			m.finish(op.job, Result{Data: out.Data, Err: out.Err})
 		} else if preparing {
 			for len(m.queue) > 0 {
 				m.finish(m.queue[0], Result{Err: out.Err})
@@ -371,6 +446,36 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 		return
 	}
 	m.state.LastError = nil
+	if op.sessionGeneration != m.sessionGeneration && (out.Sessions != nil || op.Kind == InspectSession || op.Kind == ConfirmSwitch || op.Kind == StartDisplay) {
+		if op.Kind == StartDisplay && out.Binding != nil {
+			m.state.Display, m.state.DisplayMode, m.displayID, m.cleanupDisplay = true, op.Request.Mode, op.ID, true
+		}
+		if op.job != nil {
+			m.finish(op.job, Result{Data: out.Data, Err: fmt.Errorf("session observation source changed during %s; result not reused", op.Kind)})
+		} else {
+			m.skipIdleLogoff("session source changed")
+		}
+		return
+	}
+	if out.Sessions != nil {
+		m.sessions(*out.Sessions)
+	}
+	if op.Source == SourceIdle && op.Kind == InspectSession {
+		if out.Sessions == nil || !out.Sessions.Fresh {
+			m.skipIdleLogoff("current session snapshot unavailable")
+		}
+		return
+	}
+	if op.Source == SourceIdle && op.Kind == LogoffSession {
+		m.state.Sessions.Fresh = false
+		if op.idleGeneration != m.idleGeneration {
+			return
+		}
+		m.idleLogoffDone, m.logoffReclaim = true, true
+		m.state.LogoffDeadline = time.Time{}
+		m.state.Sessions.Fresh = false
+		return
+	}
 	if m.switchDone(op, out) {
 		return
 	}
@@ -402,14 +507,18 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 			m.finish(op.job, Result{Err: fmt.Errorf("FreeRDP exited during startup")})
 			return
 		}
-		m.state.Display = true
-		m.state.DisplayMode = "remoteapp"
-		if op.Request.Need == Desktop {
-			m.state.DisplayMode = "desktop"
+		if out.Binding == nil || !out.Binding.Reference.Valid() || out.Binding.SID == "" {
+			m.finish(op.job, Result{Err: fmt.Errorf("display has no confirmed user logon")})
+			return
 		}
+		m.state.Binding = out.Binding
+		m.state.BlockingReason = ""
+		m.state.Display = true
+		m.state.DisplayMode = op.Request.Mode
 		m.displayID = op.ID
 		m.cleanupDisplay = op.revision != m.revision
 	case StopDisplay:
+		m.state.DisplayDeadline = time.Time{}
 		m.state.Display = false
 		m.state.DisplayMode = ""
 		m.displayID = 0
@@ -422,14 +531,25 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 		}
 	}
 }
-func (m *machine) begin(kind Kind, j *job) *Operation {
+func (m *machine) begin(kind Kind, j *job, source OperationSource) *Operation {
+	if source == SourceIdle && m.state.Locked {
+		return nil
+	}
 	m.nextID++
-	op := &Operation{ID: m.nextID, Kind: kind, VM: m.state.VM, revision: m.revision, job: j}
+	op := &Operation{ID: m.nextID, Kind: kind, Source: source, VM: m.state.VM, revision: m.revision, sessionGeneration: m.sessionGeneration, idleGeneration: m.idleGeneration, job: j}
+	if m.state.Binding != nil {
+		op.Reference = m.state.Binding.Reference
+	}
 	if j != nil {
 		op.Request = j.request
 		if m.switching != nil && m.switching.job == j {
 			op.Activity = m.switching.activity
-			op.RequireEmpty = m.switching.automatic
+			if kind == LogoffSession && op.Activity.Reference.Valid() {
+				op.Reference = op.Activity.Reference
+			}
+			if kind == ConfirmSwitch {
+				op.Prompt = m.switchPrompt(m.switching)
+			}
 		}
 	}
 	op.memoryRevision = m.memory.revision
@@ -437,7 +557,7 @@ func (m *machine) begin(kind Kind, j *job) *Operation {
 	op.ResumeSafe = kind == WakeVM && m.memory.phase == memoryResuming && m.memory.resumeSafe
 	op.MemoryPrepared = m.memory.WindowPrepared
 	m.busy = op
-	if kind != QueryMemory && kind != SetMemory {
+	if source == SourceUser && kind != QueryMemory && kind != SetMemory {
 		m.resetTimers()
 	}
 	return op
@@ -474,7 +594,7 @@ func (m *machine) next(now time.Time) *Operation {
 	}
 	if m.vmSubscription != subscriptionLost && m.needQuery {
 		// A snapshot serves the whole controller, not the current caller.
-		return m.begin(QueryVM, nil)
+		return m.begin(QueryVM, nil, SourceRecovery)
 	}
 	if m.vmSubscription == subscriptionNeedsSnapshot {
 		return nil // A failed refresh waits for the adapter's replacement ACK.
@@ -487,7 +607,7 @@ func (m *machine) next(now time.Time) *Operation {
 	}
 	if m.state.Display && (m.cleanupDisplay || (m.state.VM != VMRunning && m.state.VM != VMUnknown)) {
 		if head != nil || !m.autoFailed {
-			return m.begin(StopDisplay, head)
+			return m.begin(StopDisplay, head, SourceRecovery)
 		}
 		return nil
 	}
@@ -495,10 +615,6 @@ func (m *machine) next(now time.Time) *Operation {
 		return op
 	}
 	if head != nil {
-		if head.request.Need != BackendOnly && !head.request.SwitchDisplay && m.state.Display && (head.request.Need == Desktop) != (m.state.DisplayMode == "desktop") {
-			m.finish(head, Result{Err: fmt.Errorf("%s display is already active; use desktop or remoteapp to switch", m.state.DisplayMode)})
-			return nil
-		}
 		switch m.state.VM {
 		case VMUnknown:
 			return nil
@@ -506,7 +622,7 @@ func (m *machine) next(now time.Time) *Operation {
 			if m.opts.Memory != nil && m.memorySourceLost {
 				return nil
 			}
-			return m.begin(WakeVM, head)
+			return m.begin(WakeVM, head, SourceUser)
 		case VMRunning:
 		default:
 			m.finish(head, Result{Err: fmt.Errorf("cannot execute while VM is %s", m.state.VM)})
@@ -515,56 +631,33 @@ func (m *machine) next(now time.Time) *Operation {
 		if m.opts.Memory != nil && m.memory.LastError == nil && !m.memory.WindowPrepared {
 			return nil
 		}
-		if head.request.SwitchDisplay && (!m.state.Display || (head.request.Need == Desktop) != (m.state.DisplayMode == "desktop")) {
-			if op := m.switchNext(head); op != nil {
-				return op
+		if !m.state.BackendReady {
+			return nil
+		}
+		if head.request.NeedsUser() {
+			conflict := m.state.Display && head.request.Mode != m.state.DisplayMode
+			if conflict || m.switching != nil {
+				if op := m.switchNext(head); op != nil {
+					return op
+				}
+				if len(m.queue) == 0 || m.queue[0] != head || m.switching == nil || m.switching.phase != switchConnect {
+					return nil
+				}
+			} else if head.request.Choice != "" {
+				m.finish(head, Result{Err: fmt.Errorf("conflict action %q has no applicable display conflict", head.request.Choice)})
+				return nil
 			}
-			if len(m.queue) == 0 || m.queue[0] != head || m.switching == nil || m.switching.phase != switchConnect {
+			if !m.state.Display {
+				return m.begin(StartDisplay, head, SourceUser)
+			}
+			if !m.boundReady() {
+				m.finish(head, Result{Err: fmt.Errorf("owned connection has no current verified logon; no application was dispatched")})
 				return nil
 			}
 		}
-		// The display may bootstrap the current Rust agent; neither readiness
-		// condition implies an ordering dependency between backend and display.
-		if head.request.Need != BackendOnly && !m.state.Display {
-			return m.begin(StartDisplay, head)
-		}
-		if m.state.BackendReady || head.request.Need == Desktop {
-			return m.begin(Dispatch, head)
-		}
-		return nil
+		return m.begin(Dispatch, head, SourceUser)
 	}
-	if m.state.VM != VMRunning || m.autoFailed {
-		m.resetTimers()
-		return nil
-	}
-	if m.state.Display && m.state.DisplayMode != "desktop" && m.state.Windows == 0 && m.opts.IdleDisconnect > 0 {
-		if m.state.DisplayDeadline.IsZero() {
-			m.state.DisplayDeadline = now.Add(m.opts.IdleDisconnect)
-		}
-		if !now.Before(m.state.DisplayDeadline) {
-			return m.begin(StopDisplay, nil)
-		}
-	} else {
-		m.state.DisplayDeadline = time.Time{}
-	}
-	pressure := m.opts.Memory != nil && m.memory.GuestKnown && m.memory.Guest.atLeast(m.opts.Memory.StartPercent)
-	memoryKnown := m.opts.Memory == nil || m.memory.GuestKnown
-	if !m.state.Display && m.state.BackendReady && m.state.SSH == SSHZero && !m.state.Locked && memoryKnown && !m.memory.Growing && !pressure && m.opts.VMSuspend > 0 {
-		if m.state.SuspendDeadline.IsZero() {
-			m.state.SuspendDeadline = now.Add(m.opts.VMSuspend)
-		}
-		if !now.Before(m.state.SuspendDeadline) {
-			m.memoryCancelReclaim()
-			return m.begin(SuspendVM, nil)
-		}
-		if op := m.memoryReclaim(now); op != nil {
-			return op
-		}
-	} else {
-		m.state.SuspendDeadline = time.Time{}
-		m.memoryCancelReclaim()
-	}
-	return nil
+	return m.idleNext(now)
 }
 func (m *machine) deadline() time.Time {
 	if m.busy != nil {
@@ -573,6 +666,9 @@ func (m *machine) deadline() time.Time {
 		}
 		return m.busy.confirmDeadline
 	}
+	if m.memory.Reclaiming && m.memory.Awaiting && !m.state.SuspendDeadline.IsZero() && m.memory.deadline.After(m.state.SuspendDeadline) {
+		return m.memoryDeadline()
+	}
 	a, b := m.state.DisplayDeadline, m.state.SuspendDeadline
-	return earlier(earlier(a, b), m.memoryDeadline())
+	return earlier(earlier(earlier(a, b), m.state.LogoffDeadline), m.memoryDeadline())
 }

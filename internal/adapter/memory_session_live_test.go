@@ -44,7 +44,7 @@ func TestLiveMemorySessionObservations(t *testing.T) {
 	stopped := make(chan error, 1)
 	go func() { stopped <- session.Run() }()
 	defer restoreLiveMemorySession(t, session, stopped, *initial.Memory)
-	result := session.Controller.Do(ctx, controller.Request{Action: "status", Need: controller.BackendOnly})
+	result := session.Controller.Do(ctx, controller.Request{Action: "status"})
 	if result.Err != nil {
 		t.Fatal(result.Err)
 	}

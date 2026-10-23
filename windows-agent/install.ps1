@@ -214,6 +214,7 @@ if (-not $SkipTokenProvision) {
 }
 
 Write-Host "Background: remoteapp-launcher.exe backend --bind <guest-IP>:49153 --auth-token-file '$AuthTokenFile' --session-user <Windows-user> --session-host <Linux-host-IP>"
-Write-Host "RemoteApp:  remoteapp-launcher.exe interactive --bind <guest-IP>:49152 --auth-token-file '$AuthTokenFile'"
-Write-Host 'Use a controlled network. Tokens authenticate clients; they do not encrypt TCP.'
+Write-Host 'RemoteApp:  remoteapp-launcher.exe remoteapp-shell (no TCP endpoint, no token argument)'
+Write-Host 'Use a controlled network. Tokens authenticate host clients; they do not encrypt TCP.'
+Write-Host 'Existing user token-file read permissions are unchanged; only the backend reads the token in protocol 2.'
 Write-Host 'Service/startup registration and RemoteApp allow-list changes are not performed.'

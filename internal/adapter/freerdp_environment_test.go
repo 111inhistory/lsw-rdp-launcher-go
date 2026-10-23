@@ -71,7 +71,7 @@ func TestInvalidFreeRDPEnvironmentFailsBeforeCredentialsOrSpawn(t *testing.T) {
 		t.Fatal("invalid environment requested credentials")
 		return "", nil
 	}
-	d := NewDisplay(context.Background(), cfg, Agent{}, nil)
+	d := NewDisplay(context.Background(), cfg, nil)
 	if err := d.Start(context.Background(), 1, true); err == nil || !strings.Contains(err.Error(), "invalid FreeRDP environment") || d.command != nil {
 		t.Fatal("invalid environment reached process startup", err)
 	}

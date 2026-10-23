@@ -1,11 +1,10 @@
-package main
+package dialog
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/111inhistory/lsw-rdp-launcher-go/internal/controller"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -33,7 +32,7 @@ func TestDMSFloatingSurfaceAndActiveMatugenPalette(t *testing.T) {
 		t.Fatal("did not select active Matugen palette", theme)
 	}
 	for _, opaque := range []bool{false, true} {
-		d := &dialog{prompt: controller.SwitchPrompt{TargetMode: "desktop"}, style: style, opaque: opaque}
+		d := &dialog{prompt: switchPrompt(), style: style, opaque: opaque}
 		tt := ui.NewTester(d.view, 480, 220)
 		want := uint8(153) // Floating windows sync to the DMS popup alpha by default.
 		if opaque {
@@ -42,7 +41,7 @@ func TestDMSFloatingSurfaceAndActiveMatugenPalette(t *testing.T) {
 		if got := tt.Image().RGBAAt(8, 110).A; got != want {
 			t.Fatalf("opaque=%t alpha=%d, want %d", opaque, got, want)
 		}
-		card, ok := tt.Find("无法确认当前会话，仅支持保留切换。")
+		card, ok := tt.Find("注销将关闭所有应用，未保存的内容会丢失。")
 		if !ok || tt.Image().RGBAAt(int(card.X+card.W/2), int(card.Y+card.H/2)).A != 255 {
 			t.Fatal("content card must stay opaque")
 		}
@@ -59,7 +58,7 @@ func TestDMSFloatingSurfaceAndActiveMatugenPalette(t *testing.T) {
 	if style.alpha != 64 || theme.Radius != 8 || theme.Font != "Inter Variable" || theme.FontSize != 17.5 || style.fontWeight != 500 {
 		t.Fatal("DMS typography or radius was ignored", style, theme)
 	}
-	d := &dialog{prompt: controller.SwitchPrompt{TargetMode: "desktop"}, style: style}
+	d := &dialog{prompt: switchPrompt(), style: style}
 	tt := ui.NewTester(d.view, int(480*d.scale()), int(220*d.scale()))
 	for _, label := range []string{"取消", "注销并切换", "保留并切换"} {
 		r, ok := tt.Find(label)

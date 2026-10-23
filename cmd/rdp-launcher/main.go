@@ -108,12 +108,17 @@ func validateSecretInput(in io.Reader) (io.Reader, error) {
 }
 
 func run(ctx context.Context, args []string, out, stderr io.Writer) error {
+	return runWith(ctx, args, out, stderr, newConfirmFrontend(os.Stdin, stderr))
+}
+
+func runWith(ctx context.Context, args []string, out, stderr io.Writer, frontend confirmFrontend) error {
 	flags := flag.NewFlagSet("rdp-launcher", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	showVersion := flags.Bool("version", false, "print version and commit hash without contacting the controller")
 	config := flags.String("config", host.DefaultConfigPath(), "TOML configuration")
 	socket := flags.String("socket", host.DefaultSocket(), "resident controller's Unix socket")
 	timeout := flags.Duration("timeout", 3*time.Minute, "client request timeout; 0 disables it")
+	onConflict := flags.String("on-conflict", "", "decide without prompting: current, keep, logoff or cancel")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, versionString())
 		fmt.Fprintln(stderr, `Usage: rdp-launcher [global flags] COMMAND [command flags] [arguments]
@@ -121,13 +126,13 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
   version                   Print version and commit hash; no controller needed
   start                     Start the user service in the background; return when ready
   serve / watcher           Run the controller in the foreground (debugging)
-  status [--json]            Human-readable status and version; does not wake the VM
-  lock / unlock             Disable / enable automatic VM suspension
+  status                    Human-readable status and version; does not wake the VM
+  lock / unlock             Block / allow automatic disconnect, logoff, reclaim and suspend
   shutdown                  Stop the controller and its owned FreeRDP process
   ping                      Backend request; wakes the VM without starting RDP
   desktop / remoteapp        Connect or safely switch the display mode
   run [--params TEXT] [--working-dir PATH] TARGET
-  open [--app TARGET] FILE...
+  open [--app TARGET] FILE...   Open files as one ordered batch and one confirmation
   apps                      Query Windows applications plus configured [[apps]]
   sync-apps                 Cache applications, icons and .desktop entries
   install-shortcuts         Install Windows desktop and cached app shortcuts locally
@@ -138,7 +143,9 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
   auth agent set / check / clear  Manage the shared Windows agent token
   show-config                     Print the loaded configuration
 
-Command flags precede positional arguments. Global flags precede COMMAND.`)
+Command flags precede positional arguments. Global flags precede COMMAND.
+An existing Windows login is handled by a Wayland window when the compositor
+socket is usable, otherwise on a terminal; --on-conflict decides without one.`)
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -177,6 +184,9 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 		if len(args) != 0 {
 			return fmt.Errorf("serve takes no positional arguments")
 		}
+		if *onConflict != "" {
+			return fmt.Errorf("--on-conflict is not used by %s", command)
+		}
 		c, err := host.LoadConfig(*config)
 		if err != nil {
 			return err
@@ -188,14 +198,33 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 		ctx, cancel = context.WithTimeout(ctx, *timeout)
 		defer cancel()
 	}
+	choice, err := parseOnConflict(*onConflict)
+	if err != nil {
+		return err
+	}
+	switch command {
+	case "desktop", "remoteapp", "apps", "mounts", "sync-apps", "run", "open":
+	default:
+		if choice != "" {
+			return fmt.Errorf("--on-conflict is not used by %s", command)
+		}
+	}
 	print := func(data any) error {
 		encoder := json.NewEncoder(out)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(data)
 	}
+	printRaw := func(data json.RawMessage) error {
+		var value any
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		return print(value)
+	}
 	call := func(request host.Request) (json.RawMessage, error) { return host.Call(ctx, *socket, request) }
 	remote := func(request controller.Request) (json.RawMessage, error) {
-		return call(host.Request{Action: "request", Request: request})
+		request.Choice = choice
+		return host.CallWithConfirm(ctx, *socket, host.Request{Action: "request", Request: request}, frontend.choose)
 	}
 	switch command {
 	case "start":
@@ -206,10 +235,9 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 	case "status":
 		f := flag.NewFlagSet("status", flag.ContinueOnError)
 		f.SetOutput(stderr)
-		asJSON := f.Bool("json", false, "print machine-readable status, including the CLI version")
 		f.Usage = func() {
 			fmt.Fprintln(stderr, versionString())
-			fmt.Fprintln(stderr, "Usage: rdp-launcher status [--json]")
+			fmt.Fprintln(stderr, "Usage: rdp-launcher status")
 			f.PrintDefaults()
 		}
 		if err := f.Parse(args); err != nil {
@@ -220,12 +248,10 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 		}
 		data, err := call(host.Request{Action: "status"})
 		if err != nil {
-			if !*asJSON {
-				fmt.Fprintln(out, versionString())
-			}
+			fmt.Fprintln(out, versionString())
 			return err
 		}
-		return printStatus(out, data, *asJSON)
+		return printStatus(out, data)
 	case "lock", "unlock", "shutdown":
 		if len(args) != 0 {
 			return fmt.Errorf("%s takes no arguments", command)
@@ -239,11 +265,11 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 		if len(args) != 0 {
 			return fmt.Errorf("%s takes no arguments", command)
 		}
-		need := controller.Interactive
+		mode := controller.ModeRemoteApp
 		if command == "desktop" {
-			need = controller.Desktop
+			mode = controller.ModeDesktop
 		}
-		data, err := call(host.Request{Action: "switch-display", Request: controller.Request{Action: "connect", Need: need}})
+		data, err := remote(controller.Request{Action: "connect", Mode: mode})
 		if err != nil {
 			return err
 		}
@@ -252,12 +278,12 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 		if len(args) != 0 {
 			return fmt.Errorf("%s takes no arguments", command)
 		}
-		request := controller.Request{Action: "ping", Need: controller.BackendOnly}
+		request := controller.Request{Action: "ping"}
 		if command == "apps" || command == "sync-apps" {
-			request = controller.Request{Action: "list_apps", Need: controller.Interactive, WithIcons: command == "sync-apps"}
+			request = controller.Request{Action: "list_apps", Mode: controller.ModeRemoteApp, WithIcons: command == "sync-apps"}
 		}
 		if command == "mounts" {
-			request = controller.Request{Action: "get_mapped_drives", Need: controller.Interactive}
+			request = controller.Request{Action: "get_mapped_drives", Mode: controller.ModeRemoteApp}
 		}
 		data, err := remote(request)
 		if err != nil {
@@ -347,7 +373,7 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 		if *directory == "" {
 			*directory = app.WorkingDir
 		}
-		data, err := remote(controller.Request{Action: "run", Need: controller.Interactive, Target: app.Target, Params: arguments, WorkingDir: *directory})
+		data, err := remote(controller.Request{Action: "run", Mode: controller.ModeRemoteApp, Target: app.Target, Params: arguments, WorkingDir: *directory})
 		if err != nil {
 			return err
 		}
@@ -371,9 +397,9 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 		if len(files) == 0 {
 			files = []string{""}
 		}
-		var results []json.RawMessage
+		var batch []controller.Request
 		for _, file := range files {
-			request := controller.Request{Action: "open", Need: controller.Interactive}
+			request := controller.Request{Action: "open"}
 			if file != "" {
 				request.File, err = c.WindowsPath(file)
 				if err != nil {
@@ -389,15 +415,25 @@ Command flags precede positional arguments. Global flags precede COMMAND.`)
 					trailing := len(request.File) - len(strings.TrimRight(request.File, `\`))
 					params = strings.TrimSpace(params + ` "` + request.File + strings.Repeat(`\`, trailing) + `"`)
 				}
-				request = controller.Request{Action: "run", Need: controller.Interactive, Target: app.Target, Params: params, WorkingDir: app.WorkingDir}
+				request = controller.Request{Action: "run", Target: app.Target, Params: params, WorkingDir: app.WorkingDir}
 			}
-			result, err := remote(request)
-			if err != nil {
-				return err
-			}
-			results = append(results, result)
+			batch = append(batch, request)
 		}
-		return print(results)
+		// Multiple files are one FIFO job and one confirmation. The outer request
+		// carries the only mode and choice; items keep their original business payload.
+		request := batch[0]
+		if len(batch) > 1 {
+			request = controller.Request{Action: "batch", Mode: controller.ModeRemoteApp, Batch: batch}
+		} else {
+			request.Mode = controller.ModeRemoteApp
+		}
+		data, err := remote(request)
+		if len(data) > 0 {
+			if printErr := printRaw(data); printErr != nil {
+				return printErr
+			}
+		}
+		return err
 	case "path":
 		f := flag.NewFlagSet("path", flag.ContinueOnError)
 		f.SetOutput(stderr)

@@ -13,8 +13,11 @@ import (
 type statusView struct {
 	VM, SSH, DisplayMode, Operation, AwaitingVM, LastError string
 	BackendReady, Display, Locked                          bool
-	Windows, Queued                                        int
-	DisplayDeadline, SuspendDeadline                       time.Time
+	Windows, Queued, RetainedLogins                        int
+	DisplayDeadline, SuspendDeadline, LogoffDeadline       time.Time
+	Binding                                                *controller.Login
+	Sessions                                               controller.SessionSnapshot
+	Stage, BlockingReason                                  string
 	Memory                                                 struct {
 		Guest                                                                             controller.GuestMemory
 		Device                                                                            controller.MemoryDevice
@@ -24,19 +27,9 @@ type statusView struct {
 	}
 }
 
-func printStatus(out io.Writer, data json.RawMessage, asJSON bool) error {
-	if asJSON {
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(data, &fields); err != nil {
-			return err
-		}
-		if fields == nil {
-			return fmt.Errorf("controller returned an empty status")
-		}
-		fields["Version"], _ = json.Marshal(versionString())
-		encoder := json.NewEncoder(out)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(fields)
+func printStatus(out io.Writer, data json.RawMessage) error {
+	if len(data) == 0 {
+		return fmt.Errorf("controller returned an empty status")
 	}
 	var s statusView
 	s.Windows = -1
@@ -63,7 +56,35 @@ func printStatus(out io.Writer, data json.RawMessage, asJSON bool) error {
 	if s.Windows >= 0 {
 		windows = fmt.Sprint(s.Windows)
 	}
-	fmt.Fprintf(&text, "显示：%s\n窗口：%s\nSSH：%s\n自动暂停：%s\n队列：%d\n", display, windows, s.SSH, yesNo(s.Locked, "禁用（已锁定）", "启用"), s.Queued)
+	fmt.Fprintf(&text, "显示：%s\n窗口：%s\nSSH：%s\n自动回收：%s\n队列：%d\n", display, windows, s.SSH, yesNo(s.Locked, "禁用（已锁定）", "启用"), s.Queued)
+	if s.Binding == nil {
+		fmt.Fprintln(&text, "绑定会话：无")
+	} else {
+		user := s.Binding.User
+		if s.Binding.Domain != "" {
+			user = s.Binding.Domain + `\` + user
+		}
+		fmt.Fprintf(&text, "绑定会话：%d %s（登录实例 %s）\n", s.Binding.Reference.SessionID, user, s.Binding.Reference.AuthenticationID)
+	}
+	switch {
+	case s.Sessions.Revision == 0:
+		fmt.Fprintln(&text, "会话快照：未获取")
+	case s.Sessions.Fresh:
+		fmt.Fprintf(&text, "会话快照：新鲜（修订 %d，%d 个登录）\n", s.Sessions.Revision, len(s.Sessions.Sessions))
+	default:
+		fmt.Fprintf(&text, "会话快照：过期（修订 %d，%d 个登录）\n", s.Sessions.Revision, len(s.Sessions.Sessions))
+	}
+	retained := "未知"
+	if s.RetainedLogins >= 0 {
+		retained = fmt.Sprint(s.RetainedLogins)
+	}
+	fmt.Fprintf(&text, "保留登录：%s\n", retained)
+	if s.Stage != "" {
+		fmt.Fprintf(&text, "阶段：%s\n", s.Stage)
+	}
+	if s.BlockingReason != "" {
+		fmt.Fprintf(&text, "阻塞原因：%s\n", s.BlockingReason)
+	}
 	if s.Operation != "" {
 		fmt.Fprintf(&text, "当前操作：%s\n", s.Operation)
 	}
@@ -96,7 +117,7 @@ func printStatus(out io.Writer, data json.RawMessage, asJSON bool) error {
 	for _, item := range []struct {
 		name string
 		at   time.Time
-	}{{"空闲断开", s.DisplayDeadline}, {"自动暂停", s.SuspendDeadline}} {
+	}{{"空闲断开", s.DisplayDeadline}, {"自动暂停", s.SuspendDeadline}, {"空闲注销", s.LogoffDeadline}} {
 		if !item.at.IsZero() {
 			fmt.Fprintf(&text, "%s时间：%s\n", item.name, item.at.Local().Format(time.RFC3339))
 		}

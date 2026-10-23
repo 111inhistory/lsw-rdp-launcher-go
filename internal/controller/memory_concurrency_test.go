@@ -60,7 +60,7 @@ func TestControllerMemoryIOIsNotBlockedByDispatchAndDoesNotCancelIt(t *testing.T
 	dispatchCanceled := make(chan struct{})
 	memoryStarted := make(chan Operation, 1)
 	var c *Controller
-	c = New(Options{Memory: &MemoryPolicy{}}, func(ctx context.Context, op Operation) Outcome {
+	c = New(Options{Memory: &MemoryPolicy{}, IdleLogoff: -time.Second}, func(ctx context.Context, op Operation) Outcome {
 		switch op.Kind {
 		case QueryVM:
 			return Outcome{VM: VMRunning}

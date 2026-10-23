@@ -3,37 +3,32 @@ package host
 import (
 	"context"
 	"encoding/json"
-	"github.com/111inhistory/lsw-rdp-launcher-go/internal/controller"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/111inhistory/lsw-rdp-launcher-go/internal/controller"
 )
 
-func TestCheckedSwitchIPCAndNoLegacyWireBypass(t *testing.T) {
+func TestIPCPassesRequestsAndRejectsRemovedSwitchAction(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	zero := uint32(0)
+	clientCtx, stopClient := context.WithCancel(ctx)
+	defer stopClient()
 	c := controller.New(controller.Options{}, func(ctx context.Context, op controller.Operation) controller.Outcome {
 		switch op.Kind {
 		case controller.QueryVM:
 			return controller.Outcome{VM: controller.VMRunning}
-		case controller.InspectSession:
-			return controller.Outcome{Activity: &controller.SessionActivity{SessionID: 2, User: "user", Fingerprint: "logon", Windows: &zero, TrayIcons: &zero}}
-		case controller.ConfirmSwitch:
-			t.Error("empty session unexpectedly asked for confirmation")
-		case controller.LogoffSession:
-			if !op.RequireEmpty || op.Activity.SessionID != 2 {
-				t.Error(op)
-			}
 		case controller.Dispatch:
-			return controller.Outcome{Data: op.Request.Action}
+			return controller.Outcome{Data: op.Request}
 		}
 		return controller.Outcome{}
 	})
 	done := make(chan struct{})
-	go func() { defer close(done); _ = c.Run(ctx) }()
-	defer func() { cancel(); <-done }()
+	go func() { defer close(done); _ = c.Run(clientCtx) }()
+	defer func() { stopClient(); <-done }()
 	for {
 		snapshot, err := c.Snapshot(ctx)
 		if err != nil {
@@ -54,28 +49,41 @@ func TestCheckedSwitchIPCAndNoLegacyWireBypass(t *testing.T) {
 	}
 	go func() { _ = Serve(ctx, listener, c, cancel) }()
 	defer listener.Close()
-	data, err := Call(ctx, socket, Request{Action: "switch-display", Request: controller.Request{Action: "run", Need: controller.Desktop}})
-	if err != nil || string(data) != `"connect"` {
+
+	// The old privileged switch invitation and rewritten action are gone. A
+	// desktop/remoteapp command is an ordinary connect request instead.
+	_, err = Call(ctx, socket, Request{Action: "switch-display", Request: controller.Request{Action: "connect", Mode: controller.ModeDesktop}})
+	if err == nil || !strings.Contains(err.Error(), "unknown host action") {
+		t.Fatal("removed switch action was accepted", err)
+	}
+	want := controller.Request{Action: "run", Target: `C:\Windows\notepad.exe`, Params: "/x", WorkingDir: `C:\Windows`, File: `J:\notes.txt`}
+	data, err := Call(ctx, socket, Request{Action: "request", Request: want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got controller.Request
+	if err = json.Unmarshal(data, &got); err != nil || got.Action != want.Action || got.Mode != want.Mode || got.Target != want.Target || got.Params != want.Params || got.WorkingDir != want.WorkingDir || got.File != want.File {
 		t.Fatal(string(data), err)
 	}
-	// An old-style request must not silently bypass the checked endpoint. Its
-	// in-process permission is deliberately not part of the JSON wire format.
-	raw, _ := json.Marshal(controller.Request{SwitchDisplay: true})
-	var fields map[string]any
-	_ = json.Unmarshal(raw, &fields)
-	if _, exists := fields["SwitchDisplay"]; exists {
-		t.Fatal(string(raw))
+}
+
+func TestRequestWireFieldsHaveBusinessTagsOnly(t *testing.T) {
+	raw, err := json.Marshal(controller.Request{Action: "open", Mode: controller.ModeDesktop, Choice: controller.SwitchKeep, File: `J:\a.txt`, Batch: []controller.Request{{Action: "open", File: `J:\a.txt`}}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	_, err = Call(ctx, socket, Request{Action: "request", Request: controller.Request{Action: "run", Need: controller.Interactive, SwitchDisplay: true}})
-	if err == nil {
-		t.Fatal("ordinary request replaced the display")
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
 	}
-	data, err = Call(ctx, socket, Request{Action: "switch-display", Request: controller.Request{Need: controller.Interactive}})
-	if err != nil || string(data) != `"connect"` {
-		t.Fatal(string(data), err)
+	for _, name := range []string{"action", "mode", "choice", "file", "batch"} {
+		if _, ok := fields[name]; !ok {
+			t.Fatalf("missing %q in %s", name, raw)
+		}
 	}
-	snapshot, err := c.Snapshot(ctx)
-	if err != nil || snapshot.DisplayMode != "remoteapp" {
-		t.Fatal(snapshot, err)
+	for _, removed := range []string{"Need", "SwitchDisplay", "SwitchPrompt", "Confirm"} {
+		if _, ok := fields[removed]; ok {
+			t.Fatalf("legacy/private field %q leaked onto the wire: %s", removed, raw)
+		}
 	}
 }

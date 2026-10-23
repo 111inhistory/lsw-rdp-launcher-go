@@ -72,7 +72,7 @@ func TestCancelQueryHeadPreservesNextCallerAndLifecycleSubscription(t *testing.T
 	defer func() { cancel(); <-runDone }()
 	request := func(ctx context.Context, action string) <-chan controller.Result {
 		result := make(chan controller.Result, 1)
-		go func() { result <- c.Do(ctx, controller.Request{Action: action, Need: controller.BackendOnly}) }()
+		go func() { result <- c.Do(ctx, controller.Request{Action: action}) }()
 		return result
 	}
 	waitQueued := func(count int) {

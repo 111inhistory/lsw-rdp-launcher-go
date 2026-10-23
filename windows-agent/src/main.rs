@@ -4,9 +4,11 @@
 mod auth;
 mod backend;
 mod memory;
+mod protocol;
 mod session;
 mod session_ui;
 mod ssh;
+mod worker;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -15,10 +17,9 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::result::Result::Ok;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use windows_sys::core::{GUID, HRESULT};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::GdiPlus::*;
@@ -39,27 +40,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct AppInfo {
-    pub id: String,
-    pub name: String,
-    pub app_type: String, // "win32" or "uwp"
-    pub target: String,
-    // Discovery fact only. The host uses this to filter Start Menu/Desktop
-    // folders; no host policy or exclusion rules belong in the scanner.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shortcut_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub working_dir: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub icon_base64: Option<String>,
-}
+use protocol::{AppInfo, PROTOCOL};
 
 const DRIVE_REMOTE: u32 = 4;
 
-fn query_mapped_network_drives() -> Vec<(String, String)> {
+pub(crate) fn query_mapped_network_drives() -> Vec<(String, String)> {
     let mut results = Vec::new();
     unsafe {
         let mask = GetLogicalDrives();
@@ -187,40 +172,10 @@ const TIMER_KEEPALIVE_ID: usize = 1;
 const SEE_MASK_DOENVSUBST: u32 = 0x00000200;
 const SEE_MASK_FLAG_NO_UI: u32 = 0x00000400;
 
-static RUNNING: AtomicBool = AtomicBool::new(true);
-static ACTIVE_HANDLERS: AtomicUsize = AtomicUsize::new(0);
 static RDP_KEEPALIVE_ACTIVE: AtomicBool = AtomicBool::new(true);
-static LIST_APPS_RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// Releases the active-handler slot even if a handler thread unwinds.
-struct ActiveHandlerGuard;
-
-impl Drop for ActiveHandlerGuard {
-    fn drop(&mut self) {
-        ACTIVE_HANDLERS.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// Exactly one list_apps scan may run at a time; the guard resets the flag even
-/// if the scan thread unwinds.
-struct ListAppsScanGuard;
-
-impl Drop for ListAppsScanGuard {
-    fn drop(&mut self) {
-        LIST_APPS_RUNNING.store(false, Ordering::SeqCst);
-    }
-}
 
 /// Maximum accepted request frame size; prevents unbounded line reads.
-const MAX_REQUEST_BYTES: u64 = 64 * 1024;
-/// Total I/O budget for reading and writing a single client connection.
-const CLIENT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// Upper bound on concurrently handled connections; surplus connections get a busy response.
-const MAX_ACTIVE_HANDLERS: usize = 8;
-/// Upper bound on queued serial application commands.
-const MAX_PENDING_COMMANDS: usize = 32;
-/// list_apps responses can be large (icons); allow a longer write budget.
-const LIST_APPS_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
 // Session-change reasons from wtsapi32.h; windows-sys 0.59 does not re-export these.
 const WTS_REMOTE_CONNECT: u32 = 0x3;
@@ -691,7 +646,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: usize, lparam: 
         WM_DESTROY => {
             WTSUnRegisterSessionNotification(hwnd);
             SetThreadExecutionState(ES_CONTINUOUS);
-            RUNNING.store(false, Ordering::SeqCst);
             PostQuitMessage(0);
             return 0;
         }
@@ -709,7 +663,7 @@ fn init_logger() -> Option<flexi_logger::LoggerHandle> {
         "rdp-launcher-{}-{}",
         std::env::args()
             .nth(1)
-            .unwrap_or_else(|| "interactive".into()),
+            .unwrap_or_else(|| "remoteapp-shell".into()),
         std::process::id()
     );
     match flexi_logger::Logger::try_with_str("info") {
@@ -769,472 +723,18 @@ fn parse_bind_addr(args: &[String], default_port: u16) -> Result<std::net::Socke
     ))
 }
 
-fn start_daemon(args: &[String]) {
-    let configuration = parse_bind_addr(args, DEFAULT_TCP_PORT).and_then(|bind_addr| {
-        let path = auth::token_file_arg(args).map_err(|error| error.to_string())?;
-        let token =
-            auth::load_for_bind(bind_addr, path.as_deref()).map_err(|error| error.to_string())?;
-        Ok((bind_addr, token.map(Arc::new)))
-    });
-    match configuration {
-        Ok((bind_addr, token)) => run_daemon(bind_addr, token),
-        Err(e) => {
-            log::error!("Invalid daemon bind configuration: {}", e);
-            eprintln!("{}", e);
-            std::process::exit(2);
-        }
-    }
-}
-
-const DEFAULT_TCP_PORT: u16 = 49152;
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "action")]
-pub enum AgentRequest {
-    #[serde(rename = "ping")]
-    Ping,
-    #[serde(rename = "status")]
-    Status,
-    #[serde(rename = "run")]
-    Run {
-        target: String,
-        params: Option<String>,
-        #[serde(default)]
-        working_dir: Option<String>,
-    },
-    #[serde(rename = "open")]
-    Open { file: String },
-    #[serde(rename = "list_apps")]
-    ListApps {
-        #[serde(default)]
-        with_icons: bool,
-    },
-    #[serde(rename = "get_mapped_drives")]
-    GetMappedDrives,
-    #[serde(rename = "quit")]
-    Quit,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct AgentResponse {
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_active: Option<bool>,
-    #[serde(default)]
-    pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub apps: Option<Vec<AppInfo>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub drives: Option<Vec<(String, String)>>,
-}
-
-impl AgentResponse {
-    fn ok() -> Self {
-        AgentResponse {
-            status: "ok".to_string(),
-            session_id: None,
-            session_active: None,
-            role: "interactive".to_string(),
-            message: None,
-            apps: None,
-            drives: None,
-        }
-    }
-
-    fn ok_with_message(message: &str) -> Self {
-        AgentResponse {
-            message: Some(message.to_string()),
-            ..Self::ok()
-        }
-    }
-
-    fn error(message: impl Into<String>) -> Self {
-        AgentResponse {
-            status: "error".to_string(),
-            message: Some(message.into()),
-            ..Self::ok()
-        }
-    }
-}
-
-enum AppCommand {
-    Run {
-        target: String,
-        params: Option<String>,
-        working_dir: Option<String>,
-        reply: mpsc::Sender<AgentResponse>,
-    },
-    Open {
-        file: String,
-        reply: mpsc::Sender<AgentResponse>,
-    },
-    GetMappedDrives {
-        reply: mpsc::Sender<AgentResponse>,
-    },
-    Quit {
-        reply: mpsc::Sender<AgentResponse>,
-    },
-}
-
-/// A queued application command together with the instant after which it must
-/// no longer be executed.
-struct PendingCommand {
-    deadline: std::time::Instant,
-    command: AppCommand,
-}
-
-fn reject_expired(command: AppCommand) {
-    let reply = match command {
-        AppCommand::Run { reply, .. } => reply,
-        AppCommand::Open { reply, .. } => reply,
-        AppCommand::GetMappedDrives { reply } => reply,
-        AppCommand::Quit { reply } => reply,
-    };
-    let _ = reply.send(AgentResponse::error("command expired before execution"));
-}
-
-/// Serial dispatcher for application-affecting commands. run/open/quit keep a
-/// single FIFO order; Ping and the slow list_apps scan run on their own handler
-/// threads so they never block the accept loop or the serial side effects.
-fn run_dispatcher(rx: mpsc::Receiver<PendingCommand>, hwnd: HWND) {
-    let com_initialized =
-        unsafe { CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32) } >= 0;
-
-    while RUNNING.load(Ordering::SeqCst) {
-        let pending = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
-            Ok(pending) => pending,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-
-        // A queued command past its deadline must never execute later, even if
-        // its asker has already given up.
-        if std::time::Instant::now() >= pending.deadline {
-            reject_expired(pending.command);
-            continue;
-        }
-
-        match pending.command {
-            AppCommand::Run {
-                target,
-                params,
-                working_dir,
-                reply,
-            } => {
-                let response =
-                    match launch_application(&target, params.as_deref(), working_dir.as_deref()) {
-                        Ok(()) => AgentResponse::ok(),
-                        Err(e) => AgentResponse::error(e),
-                    };
-                let _ = reply.send(response);
-            }
-            AppCommand::Open { file, reply } => {
-                let response = match launch_application(&file, None, None) {
-                    Ok(()) => AgentResponse::ok(),
-                    Err(e) => AgentResponse::error(e),
-                };
-                let _ = reply.send(response);
-            }
-            AppCommand::GetMappedDrives { reply } => {
-                let response = AgentResponse {
-                    drives: Some(query_mapped_network_drives()),
-                    ..AgentResponse::ok()
-                };
-                let _ = reply.send(response);
-            }
-            AppCommand::Quit { reply } => {
-                let _ = reply.send(AgentResponse::ok_with_message("quitting"));
-                unsafe {
-                    PostMessageW(hwnd, WM_DESTROY, 0, 0);
-                }
-                break;
-            }
-        }
-    }
-
-    if com_initialized {
-        unsafe {
-            CoUninitialize();
-        }
-    }
-}
-
-fn read_request_frame(stream: &std::net::TcpStream) -> Result<String, String> {
-    use std::io::Read;
-
-    // Total frame deadline: a trickle of bytes that keeps satisfying the
-    // per-read timeout must still be bounded, so recompute the remaining
-    // budget before every read instead of trusting a single SO_RCVTIMEO.
-    let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
-    let mut reader = stream
-        .try_clone()
-        .map_err(|e| format!("connection clone failed: {}", e))?;
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 4096];
-    let mut saw_newline = false;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining < std::time::Duration::from_millis(1) {
-            return Err("request read deadline exceeded".to_string());
-        }
-        reader
-            .set_read_timeout(Some(remaining))
-            .map_err(|e| format!("failed to set read timeout: {}", e))?;
-        match reader.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                let newline = chunk[..n].iter().position(|&b| b == b'\n');
-                let take = newline.map(|pos| pos + 1).unwrap_or(n);
-                buf.extend_from_slice(&chunk[..take]);
-                if buf.len() as u64 > MAX_REQUEST_BYTES {
-                    return Err(format!(
-                        "request exceeds {} byte frame limit",
-                        MAX_REQUEST_BYTES
-                    ));
-                }
-                if newline.is_some() {
-                    saw_newline = true;
-                    break;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                return Err("request read deadline exceeded".to_string());
-            }
-            Err(e) => return Err(format!("request read failed: {}", e)),
-        }
-    }
-
-    if buf.is_empty() {
-        return Err("empty request".to_string());
-    }
-    if !saw_newline {
-        // The host always terminates requests with a newline. EOF mid-frame
-        // must not cause a partial request to be executed.
-        return Err("request frame was not newline-terminated before EOF".to_string());
-    }
-    String::from_utf8(buf).map_err(|_| "request is not valid UTF-8".to_string())
-}
-
-fn write_response(
-    stream: &mut std::net::TcpStream,
-    response: &AgentResponse,
-    budget: std::time::Duration,
-) -> Result<(), String> {
-    use std::io::Write;
-
-    let mut payload =
-        serde_json::to_vec(response).map_err(|e| format!("response encode failed: {}", e))?;
-    payload.push(b'\n');
-
-    // Total write deadline so a slow reader cannot extend the response forever.
-    let deadline = std::time::Instant::now() + budget;
-    let mut written = 0usize;
-    while written < payload.len() {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining < std::time::Duration::from_millis(1) {
-            return Err("response write deadline exceeded".to_string());
-        }
-        stream
-            .set_write_timeout(Some(remaining))
-            .map_err(|e| format!("failed to set write timeout: {}", e))?;
-        match stream.write(&payload[written..]) {
-            Ok(0) => return Err("connection closed before response was written".to_string()),
-            Ok(n) => written += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                return Err("response write deadline exceeded".to_string());
-            }
-            Err(e) => return Err(format!("response write failed: {}", e)),
-        }
-    }
-    let _ = stream.flush();
-    Ok(())
-}
-
-/// Best-effort busy reply that never blocks the accept loop.
-fn try_write_response(stream: &mut std::net::TcpStream, response: &AgentResponse) {
-    use std::io::Write;
-
-    let mut payload = match serde_json::to_vec(response) {
-        Ok(payload) => payload,
-        Err(_) => return,
-    };
-    payload.push(b'\n');
-    if stream.set_nonblocking(true).is_err() {
-        return;
-    }
-    let _ = stream.write(&payload);
-}
-
-fn dispatch_and_wait(
-    request: AgentRequest,
-    tx: &mpsc::SyncSender<PendingCommand>,
-) -> AgentResponse {
-    if !RUNNING.load(Ordering::SeqCst) {
-        return AgentResponse::error("agent is shutting down");
-    }
-
-    let budget = CLIENT_IO_TIMEOUT;
-    let deadline = std::time::Instant::now() + budget;
-
-    let (reply_tx, reply_rx) = mpsc::channel();
-    let command = match request {
-        AgentRequest::Run {
-            target,
-            params,
-            working_dir,
-        } => AppCommand::Run {
-            target,
-            params,
-            working_dir,
-            reply: reply_tx,
-        },
-        AgentRequest::Open { file } => AppCommand::Open {
-            file,
-            reply: reply_tx,
-        },
-        AgentRequest::GetMappedDrives => AppCommand::GetMappedDrives { reply: reply_tx },
-        AgentRequest::Quit => AppCommand::Quit { reply: reply_tx },
-        AgentRequest::Ping | AgentRequest::Status | AgentRequest::ListApps { .. } => {
-            return AgentResponse::error("request is not serial-dispatched");
-        }
-    };
-
-    // Never block a handler on a full or dead queue: a stalled dispatcher must
-    // not be able to pin all eight handler slots on enqueue.
-    match tx.try_send(PendingCommand { deadline, command }) {
-        Ok(()) => {}
-        Err(mpsc::TrySendError::Full(_)) => return AgentResponse::error("agent is busy"),
-        Err(mpsc::TrySendError::Disconnected(_)) => {
-            return AgentResponse::error("agent dispatcher is not available");
-        }
-    }
-
-    match reply_rx.recv_timeout(budget) {
-        Ok(response) => response,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            AgentResponse::error("command is still executing; outcome unknown")
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            AgentResponse::error("agent dispatcher stopped before replying; outcome unknown")
-        }
-    }
-}
-
-fn handle_tcp_client(
-    stream: &mut std::net::TcpStream,
-    dispatch_tx: &mpsc::SyncSender<PendingCommand>,
-    token: Option<&auth::Token>,
-) {
-    let line = match read_request_frame(stream) {
-        Ok(line) => line,
-        Err(e) => {
-            if let Err(write_err) =
-                write_response(stream, &AgentResponse::error(e), CLIENT_IO_TIMEOUT)
-            {
-                log::warn!("Failed to send error response: {}", write_err);
-            }
-            return;
-        }
-    };
-
-    let mut request: serde_json::Value = match serde_json::from_str(line.trim()) {
-        Ok(request) => request,
-        Err(e) => {
-            log::warn!("Rejected malformed TCP request: {}", e);
-            if let Err(write_err) = write_response(
-                stream,
-                &AgentResponse::error(format!("Invalid request: {}", e)),
-                CLIENT_IO_TIMEOUT,
-            ) {
-                log::warn!("Failed to send error response: {}", write_err);
-            }
-            return;
-        }
-    };
-    let action = auth::action(&request).to_string();
-    if !auth::authorize(&request, token) {
-        log::warn!("Rejected unauthenticated TCP request (action: {})", action);
-        if let Err(write_err) = write_response(
-            stream,
-            &AgentResponse::error("authentication required"),
-            CLIENT_IO_TIMEOUT,
-        ) {
-            log::warn!("Failed to send error response: {}", write_err);
-        }
-        return;
-    }
-    auth::remove_token_field(&mut request);
-    log::info!("Incoming TCP request (action: {})", action);
-
-    let (response, write_budget) = match serde_json::from_value::<AgentRequest>(request) {
-        Ok(AgentRequest::Ping) => (AgentResponse::ok_with_message("pong"), CLIENT_IO_TIMEOUT),
-        Ok(AgentRequest::Status) => {
-            let (session_id, session_active) = session::current_active();
-            (
-                AgentResponse {
-                    session_id,
-                    session_active,
-                    ..AgentResponse::ok_with_message("interactive endpoint ready")
-                },
-                CLIENT_IO_TIMEOUT,
-            )
-        }
-        Ok(AgentRequest::ListApps { with_icons }) => {
-            if LIST_APPS_RUNNING
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                (
-                    AgentResponse::error("list_apps scan already in progress"),
-                    CLIENT_IO_TIMEOUT,
-                )
-            } else {
-                let _scan_guard = ListAppsScanGuard;
-                (
-                    AgentResponse {
-                        apps: Some(scan_shortcuts(with_icons)),
-                        ..AgentResponse::ok()
-                    },
-                    LIST_APPS_WRITE_TIMEOUT,
-                )
-            }
-        }
-        Ok(request) => (dispatch_and_wait(request, dispatch_tx), CLIENT_IO_TIMEOUT),
-        Err(e) => (
-            AgentResponse::error(format!("Invalid request: {}", e)),
-            CLIENT_IO_TIMEOUT,
-        ),
-    };
-
-    log::info!("Outgoing TCP response (status: {})", response.status);
-    if let Err(write_err) = write_response(stream, &response, write_budget) {
-        log::warn!("Failed to send response: {}", write_err);
-    }
-}
-
-fn run_daemon(bind_addr: std::net::SocketAddr, token: Option<Arc<auth::Token>>) {
+/// RemoteApp shell keepalive. Internal role only: it holds execution state and
+/// the tray icon, and deliberately has no request listener.
+fn run_remoteapp_shell() {
     unsafe {
-        let chwnd = GetConsoleWindow();
-        if !chwnd.is_null() {
-            ShowWindow(chwnd, 0); // SW_HIDE
+        let console = GetConsoleWindow();
+        if !console.is_null() {
+            ShowWindow(console, 0); // SW_HIDE
         }
         let class_name = to_wide("RemoteAppLauncherClass");
-        let window_name = to_wide("RemoteApp Launcher Daemon");
+        let window_name = to_wide("RemoteApp Launcher Shell");
 
-        let wc = WNDCLASSW {
+        let class = WNDCLASSW {
             style: 0,
             lpfnWndProc: Some(wnd_proc),
             cbClsExtra: 0,
@@ -1246,10 +746,8 @@ fn run_daemon(bind_addr: std::net::SocketAddr, token: Option<Arc<auth::Token>>) 
             lpszMenuName: ptr::null(),
             lpszClassName: class_name.as_ptr(),
         };
-
-        RegisterClassW(&wc);
-
-        let hwnd = CreateWindowExW(
+        RegisterClassW(&class);
+        let window = CreateWindowExW(
             0,
             class_name.as_ptr(),
             window_name.as_ptr(),
@@ -1258,107 +756,46 @@ fn run_daemon(bind_addr: std::net::SocketAddr, token: Option<Arc<auth::Token>>) 
             0,
             0,
             0,
-            -3_isize as HWND, // HWND_MESSAGE (message-only window)
+            -3_isize as HWND, // HWND_MESSAGE
             ptr::null_mut(),
-            wc.hInstance,
+            class.hInstance,
             ptr::null_mut(),
         );
-
-        if hwnd.is_null() {
-            eprintln!("Failed to create daemon message window");
+        if window.is_null() {
+            eprintln!("Failed to create RemoteApp shell message window");
             return;
         }
 
-        if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) == 0 {
+        if WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) == 0 {
             log::warn!(
-                "WTSRegisterSessionNotification failed (Win32 error {}); keeping RDP keepalive active",
+                "WTSRegisterSessionNotification failed (Win32 error {}); keeping keepalive active",
                 GetLastError()
             );
         }
 
-        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hWnd = hwnd;
-        nid.uID = 1;
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-        nid.uCallbackMessage = WM_TRAYICON;
-        nid.hIcon = LoadIconW(ptr::null_mut(), IDI_APPLICATION);
-
+        let mut icon: NOTIFYICONDATAW = std::mem::zeroed();
+        icon.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        icon.hWnd = window;
+        icon.uID = 1;
+        icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        icon.uCallbackMessage = WM_TRAYICON;
+        icon.hIcon = LoadIconW(ptr::null_mut(), IDI_APPLICATION);
         let tip = to_wide("RemoteApp 保活中 (FreeRDP)");
-        let len = tip.len().min(nid.szTip.len());
-        nid.szTip[..len].copy_from_slice(&tip[..len]);
-
-        Shell_NotifyIconW(NIM_ADD, &nid);
+        let length = tip.len().min(icon.szTip.len());
+        icon.szTip[..length].copy_from_slice(&tip[..length]);
+        Shell_NotifyIconW(NIM_ADD, &icon);
 
         SetThreadExecutionState(
             ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED | ES_DISPLAY_REQUIRED,
         );
-        SetTimer(hwnd, TIMER_KEEPALIVE_ID, 60_000, None);
+        SetTimer(window, TIMER_KEEPALIVE_ID, 60_000, None);
 
-        // Serial application dispatcher; owns the raw HWND as an integer so it
-        // can request shutdown without sharing window state across threads.
-        let (dispatch_tx, dispatch_rx) = mpsc::sync_channel::<PendingCommand>(MAX_PENDING_COMMANDS);
-        let dispatch_hwnd = hwnd as usize;
-        std::thread::spawn(move || run_dispatcher(dispatch_rx, dispatch_hwnd as HWND));
-
-        // The listener thread needs the window handle only to request shutdown
-        // when the initial bind fails.
-        let listener_hwnd = hwnd as usize;
-        // TCP server listener thread bound strictly to the address commanded by the host launcher
-        std::thread::spawn(move || {
-            match std::net::TcpListener::bind(bind_addr) {
-                Ok(listener) => {
-                    log::info!("TCP Agent successfully listening on {}", bind_addr);
-                    for stream in listener.incoming() {
-                        if !RUNNING.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let mut stream = match stream {
-                            Ok(stream) => stream,
-                            Err(e) => {
-                                log::warn!("TCP accept failed: {}", e);
-                                continue;
-                            }
-                        };
-
-                        if ACTIVE_HANDLERS.fetch_add(1, Ordering::SeqCst) >= MAX_ACTIVE_HANDLERS {
-                            ACTIVE_HANDLERS.fetch_sub(1, Ordering::SeqCst);
-                            try_write_response(&mut stream, &AgentResponse::error("agent is busy"));
-                            continue;
-                        }
-
-                        let dispatch_tx = dispatch_tx.clone();
-                        let token = token.clone();
-                        std::thread::spawn(move || {
-                            let _guard = ActiveHandlerGuard;
-                            handle_tcp_client(&mut stream, &dispatch_tx, token.as_deref());
-                        });
-                    }
-                }
-                Err(e) => {
-                    log::error!(
-                        "CRITICAL ERROR: Failed to bind TCP listener on {}: {}",
-                        bind_addr,
-                        e
-                    );
-                    eprintln!("Failed to bind TCP listener on {}: {}", bind_addr, e);
-                    // A failed bind must not leave the daemon, keepalive and
-                    // singleton mutex alive with no RPC endpoint. Ask the main
-                    // window to close so the process exits and the mutex is
-                    // relinquished for a later retry.
-                    RUNNING.store(false, Ordering::SeqCst);
-                    PostMessageW(listener_hwnd as HWND, WM_CLOSE, 0, 0);
-                }
-            }
-        });
-
-        let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        let mut message: MSG = std::mem::zeroed();
+        while GetMessageW(&mut message, ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
-
-        Shell_NotifyIconW(NIM_DELETE, &nid);
+        Shell_NotifyIconW(NIM_DELETE, &icon);
     }
 }
 
@@ -1447,73 +884,36 @@ fn launch_application(
     }
 }
 
-fn resolve_target_and_params(args: &[String]) -> (String, Option<String>) {
-    let raw_joined = args.join(" ");
-    let clean_joined = raw_joined.trim().trim_matches('"');
+const DEFAULT_BACKEND_PORT: u16 = 49153;
 
-    // 1. If the entire string is an existing file or directory on disk, it's a single target
-    if Path::new(clean_joined).exists() {
-        return (clean_joined.to_string(), None);
-    }
-
-    // 2. Try to find an existing executable prefix among arguments
-    for i in (1..args.len()).rev() {
-        let prefix = args[..i].join(" ");
-        let clean_prefix = prefix.trim().trim_matches('"');
-        if Path::new(clean_prefix).is_file() {
-            let params = args[i..].join(" ");
-            let clean_params = params.trim();
-            return (
-                clean_prefix.to_string(),
-                if clean_params.is_empty() {
-                    None
-                } else {
-                    Some(clean_params.to_string())
-                },
-            );
-        }
-    }
-
-    // 3. If first argument ends with .exe, assume first argument is binary and rest are params
-    if let Some(first) = args.first() {
-        let clean_first = first.trim().trim_matches('"');
-        if clean_first.to_lowercase().ends_with(".exe")
-            || clean_first.to_lowercase().ends_with(".cmd")
-            || clean_first.to_lowercase().ends_with(".bat")
-        {
-            let params = args[1..].join(" ");
-            let clean_params = params.trim();
-            return (
-                clean_first.to_string(),
-                if clean_params.is_empty() {
-                    None
-                } else {
-                    Some(clean_params.to_string())
-                },
-            );
-        }
-    }
-
-    // 4. Default fallback: treat entire string as target
-    (clean_joined.to_string(), None)
-}
-
-fn send_tcp_request(args: &[String], req: &AgentRequest) -> Result<serde_json::Value, String> {
+fn send_request(
+    args: &[String],
+    action: &str,
+    extra: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     use std::io::{BufRead, BufReader, Write};
-    let addr = parse_bind_addr(args, DEFAULT_TCP_PORT)?;
+    let addr = parse_bind_addr(args, DEFAULT_BACKEND_PORT)?;
     let token = auth::token_file_arg(args)
-        .map_err(|e| e.to_string())?
-        .map(|path| auth::Token::load(&path).map_err(|e| e.to_string()))
+        .map_err(|error| error.to_string())?
+        .map(|path| auth::Token::load(&path).map_err(|error| error.to_string()))
         .transpose()?;
     let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
-        .map_err(|e| format!("Daemon not reachable: {}", e))?;
+        .map_err(|error| format!("Backend not reachable: {error}"))?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(60)))
-        .map_err(|e| format!("failed to set read timeout: {}", e))?;
+        .map_err(|error| format!("failed to set read timeout: {error}"))?;
     stream
         .set_write_timeout(Some(std::time::Duration::from_secs(5)))
-        .map_err(|e| format!("failed to set write timeout: {}", e))?;
-    let mut body = serde_json::to_value(req).map_err(|e| e.to_string())?;
+        .map_err(|error| format!("failed to set write timeout: {error}"))?;
+    let mut body = serde_json::json!({
+        "action": action,
+        "protocol": PROTOCOL,
+    });
+    if let (serde_json::Value::Object(fields), serde_json::Value::Object(extra)) =
+        (&mut body, extra)
+    {
+        fields.extend(extra);
+    }
     if let Some(token) = &token {
         if let serde_json::Value::Object(fields) = &mut body {
             fields.insert(
@@ -1522,17 +922,25 @@ fn send_tcp_request(args: &[String], req: &AgentRequest) -> Result<serde_json::V
             );
         }
     }
-    let mut json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+    let mut json = serde_json::to_string(&body).map_err(|error| error.to_string())?;
     json.push('\n');
     stream
         .write_all(json.as_bytes())
-        .map_err(|e| e.to_string())?;
-    stream.flush().map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
+    stream.flush().map_err(|error| error.to_string())?;
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
-    let response: serde_json::Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+    reader
+        .read_line(&mut line)
+        .map_err(|error| error.to_string())?;
+    let response: serde_json::Value =
+        serde_json::from_str(&line).map_err(|error| error.to_string())?;
+    if response["protocol"] != PROTOCOL {
+        return Err(
+            "protocol mismatch: Windows agent and this CLI must be upgraded together".to_string(),
+        );
+    }
     if response["status"] != "ok" {
         return Err(response["message"]
             .as_str()
@@ -1548,7 +956,7 @@ fn main() {
         SetConsoleOutputCP(65001);
     }
     let args: Vec<String> = std::env::args().collect();
-    let subcommand = args.get(1).map(|s| s.as_str()).unwrap_or("daemon");
+    let subcommand = args.get(1).map(String::as_str).unwrap_or("help");
 
     if let Some(index) = args.iter().position(|arg| arg == "--log-dir") {
         let directory = args.get(index + 1).unwrap_or_else(|| {
@@ -1562,42 +970,41 @@ fn main() {
         std::env::set_var("RDP_LAUNCHER_LOG_DIR", directory);
     }
     let _logger = init_logger();
-    if subcommand == "session-probe" {
-        let result = args
-            .get(2)
-            .ok_or_else(|| std::io::Error::other("missing probe output path"))
-            .and_then(|path| session::write_probe(std::path::Path::new(path)));
-        if let Err(error) = result {
-            eprintln!("{error}");
+
+    if subcommand == "user-worker" {
+        let pipe = args
+            .iter()
+            .position(|arg| arg == "--pipe")
+            .and_then(|index| args.get(index + 1));
+        let Some(pipe) = pipe else {
+            eprintln!("user-worker requires --pipe NAME");
+            std::process::exit(2);
+        };
+        if let Err(error) = worker::run_client(pipe) {
+            log::error!("user worker failed: {error}");
             std::process::exit(1);
         }
         return;
     }
 
-    // Do not log the full argument vector: it can contain operator paths.
-    log::info!("Process started: subcommand='{}'", subcommand);
+    log::info!("Process started: subcommand='{subcommand}'");
 
-    // Enforce strict singleton for the daemon instance in this session
-    if matches!(subcommand, "daemon" | "interactive") {
+    if subcommand == "remoteapp-shell" {
         unsafe {
-            let bind = parse_bind_addr(&args, DEFAULT_TCP_PORT).unwrap_or_else(|error| {
-                eprintln!("{error}");
-                std::process::exit(2)
-            });
-            let mutex_name = to_wide(&format!("Local\\RdpLauncher_Interactive_{bind}"));
-            let h_mutex = CreateMutexW(ptr::null_mut(), FALSE, mutex_name.as_ptr());
-            if h_mutex.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
-                log::info!(
-                    "Singleton mutex check: another daemon instance is already active. Exiting."
-                );
-                std::process::exit(0);
+            let mutex_name = to_wide("Local\\RdpLauncher_RemoteAppShell");
+            let mutex = CreateMutexW(ptr::null_mut(), FALSE, mutex_name.as_ptr());
+            if mutex.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
+                log::info!("RemoteApp shell keepalive is already running in this session");
+                return;
             }
         }
+        run_remoteapp_shell();
+        return;
     }
 
     match subcommand {
         "list-apps" => {
-            let with_icons = args.iter().any(|a| a == "--with-icons");
+            let with_icons = args.iter().any(|arg| arg == "--with-icons");
             let apps = scan_shortcuts(with_icons);
             if let Ok(json) = serde_json::to_string_pretty(&apps) {
                 print_to_stdout(&json);
@@ -1606,51 +1013,18 @@ fn main() {
         }
         "check-ssh" => {
             if let Some(count) = ssh::count() {
-                print_to_stdout(&format!("Active SSH connections: {}\r\n", count));
+                print_to_stdout(&format!("Active SSH connections: {count}\r\n"));
             } else {
                 print_to_stdout("Failed to query active SSH connections\r\n");
             }
-            std::process::exit(0);
         }
-        "ping" | "status" | "apps" | "mounts" | "open" | "run" | "stop" | "quit" => {
-            let mut positional = Vec::new();
-            let mut i = 2;
-            while i < args.len() {
-                if args[i] == "--bind" || args[i] == "--log-dir" || args[i] == "--auth-token-file" {
-                    i += 2;
-                } else {
-                    positional.push(args[i].clone());
-                    i += 1;
-                }
-            }
-            let request = match subcommand {
-                "ping" => AgentRequest::Ping,
-                "status" => AgentRequest::Status,
-                "apps" => AgentRequest::ListApps { with_icons: false },
-                "mounts" => AgentRequest::GetMappedDrives,
-                "stop" | "quit" => AgentRequest::Quit,
-                "open" if positional.len() == 1 => AgentRequest::Open {
-                    file: positional[0].clone(),
-                },
-                "run" if !positional.is_empty() => {
-                    let (target, params) = resolve_target_and_params(&positional);
-                    AgentRequest::Run {
-                        target,
-                        params,
-                        working_dir: None,
-                    }
-                }
-                _ => {
-                    eprintln!("open requires one file; run requires a target");
-                    std::process::exit(2);
-                }
-            };
-            match send_tcp_request(&args, &request) {
+        "ping" | "status" | "quit" => {
+            match send_request(&args, subcommand, serde_json::json!({})) {
                 Ok(response) => {
                     if subcommand == "ping" {
                         print_to_stdout("PONG\r\n");
                     } else {
-                        print_to_stdout(&format!("{}\r\n", response));
+                        print_to_stdout(&format!("{response}\r\n"));
                     }
                 }
                 Err(error) => {
@@ -1659,11 +1033,26 @@ fn main() {
                 }
             }
         }
-        "help" | "--help" | "-h" => {
-            print_to_stdout("remoteapp-launcher backend|interactive [--bind IP:PORT] [--log-dir DIR] [--auth-token-file PATH]\r\nremoteapp-launcher ping|status|apps|mounts|quit [--bind IP:PORT] [--auth-token-file PATH]\r\nremoteapp-launcher run TARGET [ARGS...] [--bind IP:PORT] [--auth-token-file PATH]\r\nremoteapp-launcher open FILE [--bind IP:PORT] [--auth-token-file PATH]\r\nremoteapp-launcher list-apps [--with-icons] | check-ssh\r\n");
+        "inspect-sessions" => {
+            let user = args
+                .iter()
+                .position(|arg| arg == "--user")
+                .and_then(|index| args.get(index + 1))
+                .cloned();
+            let extra = match user {
+                Some(user) => serde_json::json!({"user": user}),
+                None => serde_json::json!({}),
+            };
+            match send_request(&args, "inspect_sessions", extra) {
+                Ok(response) => print_to_stdout(&format!("{response}\r\n")),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
         }
         "backend" => {
-            let result = parse_bind_addr(&args, 49153)
+            let result = parse_bind_addr(&args, DEFAULT_BACKEND_PORT)
                 .map_err(std::io::Error::other)
                 .and_then(|addr| backend::run(addr, &args));
             if let Err(error) = result {
@@ -1672,7 +1061,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        "daemon" | "interactive" => start_daemon(&args),
+        "help" | "--help" | "-h" => {
+            print_to_stdout(
+                "remoteapp-launcher backend [--bind IP:PORT] [--log-dir DIR] [--auth-token-file PATH] [--session-user USER --session-host IP]\r\n\
+remoteapp-launcher remoteapp-shell [--log-dir DIR]\r\n\
+remoteapp-launcher ping|status|quit|inspect-sessions [--bind IP:PORT] [--auth-token-file PATH]\r\n\
+remoteapp-launcher list-apps [--with-icons] | check-ssh\r\n",
+            );
+        }
         _ => {
             eprintln!("Unknown command: {subcommand}");
             std::process::exit(2);

@@ -149,14 +149,14 @@ agent_token_file = 'C:\ProgramData\rdp-launcher\agent-token'
 	if err != nil {
 		t.Fatal(err)
 	}
+	if c.Server.AgentTokenFile != `C:\ProgramData\rdp-launcher\agent-token` {
+		t.Fatalf("config agent token file = %q", c.Server.AgentTokenFile)
+	}
 	cfg, err := c.Adapter()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.AgentToken == nil {
 		t.Fatal("adapter has no agent token provider")
-	}
-	if cfg.Display.AgentTokenFile != `C:\ProgramData\rdp-launcher\agent-token` {
-		t.Fatalf("display token file = %q", cfg.Display.AgentTokenFile)
 	}
 }

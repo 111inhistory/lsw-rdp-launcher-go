@@ -41,15 +41,16 @@ func TestInstallShortcutsWithoutControllerOrGuest(t *testing.T) {
 
 func TestApplicationAndDesktopCLIRequests(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		args    []string
-		params  string
-		desktop bool
+		name   string
+		args   []string
+		mode   string
+		action string
+		params string
 	}{
-		{"run", []string{"run", "--params", "/new", "explorer"}, "/separate /new", false},
-		{"open", []string{"open", "--app", "文件资源管理器", `J:\folder with spaces\`}, `/separate "J:\folder with spaces\\"`, false},
-		{"desktop", []string{"desktop"}, "", true},
-		{"remoteapp", []string{"remoteapp"}, "", true},
+		{"run", []string{"run", "--params", "/new", "explorer"}, controller.ModeRemoteApp, "run", "/separate /new"},
+		{"open", []string{"open", "--app", "文件资源管理器", `J:\folder with spaces\`}, controller.ModeRemoteApp, "run", `/separate "J:\folder with spaces\\"`},
+		{"desktop", []string{"desktop"}, controller.ModeDesktop, "connect", ""},
+		{"remoteapp", []string{"remoteapp"}, controller.ModeRemoteApp, "connect", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -70,20 +71,7 @@ working_dir='C:\Windows'
 				t.Fatal(err)
 			}
 			defer listener.Close()
-			received := make(chan host.Request, 1)
-			go func() {
-				conn, err := listener.Accept()
-				if err != nil {
-					return
-				}
-				defer conn.Close()
-				var req host.Request
-				if json.NewDecoder(conn).Decode(&req) != nil {
-					return
-				}
-				received <- req
-				_ = json.NewEncoder(conn).Encode(host.Response{Data: json.RawMessage(`{"status":"ok"}`)})
-			}()
+			received := serveHostOnce(t, listener, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			var out, stderr bytes.Buffer
@@ -92,18 +80,151 @@ working_dir='C:\Windows'
 				t.Fatal(err, stderr.String())
 			}
 			req := <-received
-			if tc.desktop {
-				need := controller.Desktop
-				if tc.name == "remoteapp" {
-					need = controller.Interactive
+			if req.Action != "request" {
+				t.Fatalf("wrong envelope: %+v", req)
+			}
+			got := req.Request
+			if got.Action != tc.action || got.Mode != tc.mode || got.Batch != nil || got.Choice != "" {
+				t.Fatalf("wrong request: %+v", got)
+			}
+			switch tc.action {
+			case "connect":
+				if got.Target != "" {
+					t.Fatalf("connect rewrote a business target: %+v", got)
 				}
-				if req.Action != "switch-display" || req.Request.Action != "connect" || req.Request.Need != need || req.Request.SwitchDisplay || req.Request.Target != "" {
-					t.Fatalf("wrong desktop request: %+v", req)
+			case "run":
+				if got.Target != `C:\Windows\explorer.exe` || got.Params != tc.params || got.WorkingDir != `C:\Windows` {
+					t.Fatalf("wrong application payload: %+v", got)
 				}
-			} else if req.Action != "request" || req.Request.Action != "run" || req.Request.Target != `C:\Windows\explorer.exe` || req.Request.Params != tc.params || req.Request.WorkingDir != `C:\Windows` {
-				t.Fatalf("wrong request: %+v", req)
 			}
 		})
+	}
+}
+
+func TestOpenBatchIsOneRequestAndOneConfirmation(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
+	path := filepath.Join(root, "config.toml")
+	if err := os.WriteFile(path, []byte(`[[apps]]
+id="explorer"
+name="Explorer"
+target='C:\Windows\explorer.exe'
+working_dir='C:\Windows'
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(root, "controller.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	confirmed := make(chan controller.SwitchDecision, 2)
+	received := serveHostOnce(t, listener, func(decoder *json.Decoder, encoder *json.Encoder, request host.Request) {
+		if request.Action != "request" || request.Request.Action != "batch" {
+			t.Errorf("wrong batch envelope: %+v", request)
+			return
+		}
+		if request.Request.Mode != controller.ModeRemoteApp || request.Request.Choice != "" {
+			t.Errorf("wrong batch mode/choice: %+v", request.Request)
+		}
+		batch := request.Request.Batch
+		if len(batch) != 2 {
+			t.Errorf("wrong ordered batch: %+v", batch)
+			return
+		}
+		for index, name := range []string{`J:\a.txt`, `J:\b.txt`} {
+			item := batch[index]
+			if item.Action != "run" || item.Target != `C:\Windows\explorer.exe` || !strings.Contains(item.Params, name) || item.WorkingDir != `C:\Windows` {
+				t.Errorf("batch item %d lost its payload: %+v", index, item)
+			}
+			if item.Batch != nil || item.Choice != "" || item.Confirm != nil || item.Mode != "" {
+				t.Errorf("batch item is not plain business payload: %+v", item)
+			}
+		}
+		prompt := controller.SwitchPrompt{TargetMode: controller.ModeRemoteApp, Allowed: []controller.SwitchDecision{controller.SwitchKeep, controller.SwitchCancel}}
+		if err := encoder.Encode(host.Response{Type: "confirm", ID: 1, Prompt: &prompt}); err != nil {
+			t.Error(err)
+			return
+		}
+		var reply struct {
+			Type     string
+			ID       uint64
+			Decision controller.SwitchDecision
+		}
+		if err := decoder.Decode(&reply); err != nil {
+			t.Error(err)
+			return
+		}
+		if reply.Type != "decision" || reply.ID != 1 {
+			t.Errorf("wrong decision frame: %+v", reply)
+		}
+		confirmed <- reply.Decision
+		_ = encoder.Encode(host.Response{Type: "result", Data: json.RawMessage(`[{"status":"ok"},{"status":"ok"}]`)})
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	prompts := 0
+	frontend := confirmFrontend{
+		stdin:   strings.NewReader(""),
+		stderr:  &bytes.Buffer{},
+		wayland: func() bool { return true },
+		gui: func(context.Context, controller.SwitchPrompt) (controller.SwitchDecision, error) {
+			prompts++
+			return controller.SwitchKeep, nil
+		},
+	}
+	var out, stderr bytes.Buffer
+	if err = runWith(ctx, []string{"--config", path, "--socket", socket, "open", "--app", "explorer", `J:\a.txt`, `J:\b.txt`}, &out, &stderr, frontend); err != nil {
+		t.Fatal(err, stderr.String())
+	}
+	request := <-received
+	if request.Request.Choice != "" {
+		t.Fatalf("implicit choice was sent: %+v", request.Request)
+	}
+	if decision := <-confirmed; decision != controller.SwitchKeep {
+		t.Fatal(decision)
+	}
+	if prompts != 1 {
+		t.Fatalf("prompted %d times for one batch", prompts)
+	}
+	if !strings.Contains(out.String(), `"status": "ok"`) {
+		t.Fatal(out.String())
+	}
+}
+
+func TestOpenExplicitChoiceNeedsNoPrompt(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
+	path := filepath.Join(root, "config.toml")
+	if err := os.WriteFile(path, []byte("# no apps\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(root, "controller.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	received := serveHostOnce(t, listener, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	frontend := confirmFrontend{
+		stdin:   strings.NewReader(""),
+		stderr:  &bytes.Buffer{},
+		wayland: func() bool { return false },
+		gui: func(context.Context, controller.SwitchPrompt) (controller.SwitchDecision, error) {
+			t.Error("explicit choice still prompted")
+			return controller.SwitchCancel, nil
+		},
+	}
+	var out, stderr bytes.Buffer
+	if err = runWith(ctx, []string{"--on-conflict=logoff", "--config", path, "--socket", socket, "open", `J:\a.txt`}, &out, &stderr, frontend); err != nil {
+		t.Fatal(err, stderr.String())
+	}
+	request := <-received
+	if request.Request.Choice != controller.SwitchLogoff || request.Request.Action != "open" {
+		t.Fatalf("explicit choice was not sent once: %+v", request.Request)
 	}
 }
 
@@ -194,6 +315,20 @@ user = "alice"
 		}
 		if strings.Contains(out.String(), invalid) && invalid != "" {
 			t.Fatal("invalid secret was printed")
+		}
+	}
+}
+
+func TestOnConflictIsRejectedWhereNoSessionChoiceExists(t *testing.T) {
+	for _, args := range [][]string{
+		{"--on-conflict=keep", "ping"},
+		{"--on-conflict=keep", "status"},
+		{"--on-conflict=maybe", "open", `J:\a.txt`},
+	} {
+		var out, stderr bytes.Buffer
+		err := run(context.Background(), args, &out, &stderr)
+		if err == nil {
+			t.Fatal("accepted", args)
 		}
 	}
 }

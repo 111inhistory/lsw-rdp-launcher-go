@@ -1,6 +1,6 @@
 //! Runs only in the selected user's WinSta0 desktop. Unknown tray state stays
 //! null: RemoteApp shells and unsupported shell versions must never look empty.
-use crate::session::Ui;
+use crate::protocol::Ui;
 use std::{
     collections::HashSet,
     ptr,
@@ -220,7 +220,8 @@ unsafe fn tray_icons() -> Option<u32> {
         if unregistered >= 0 {
             // This private interface has no documented enumeration-complete
             // signal. Positive observations prove activity, but no callback
-            // cannot prove an empty tray. Never authorize automatic logoff on it.
+            // cannot prove an empty tray. UI counts are activity observations,
+            // never authorization for logoff.
             (*cb).icons.lock().ok().and_then(|icons| {
                 if icons.is_empty() {
                     None

@@ -3,6 +3,8 @@ package adapter
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/111inhistory/lsw-rdp-launcher-go/internal/controller"
@@ -10,31 +12,25 @@ import (
 )
 
 type Config struct {
-	LibvirtSocket, LibvirtURI, Domain  string
-	NiriSocket, FreeRDPAppID           string
-	AgentEndpoint, InteractiveEndpoint string
-	AgentToken                         func(context.Context) (string, error)
-	Display                            DisplayConfig
-	MemoryAlias                        string
-	DialogBinary                       string
-	Policy                             controller.Options
+	LibvirtSocket, LibvirtURI, Domain string
+	NiriSocket, FreeRDPAppID          string
+	AgentEndpoint                     string
+	AgentToken                        func(context.Context) (string, error)
+	Display                           DisplayConfig
+	MemoryAlias                       string
+	Policy                            controller.Options
 }
 type Session struct {
-	Controller   *controller.Controller
-	vm           *Libvirt
-	memory       *MemoryLibvirt
-	agent        Agent
-	display      *Display
-	niriSocket   string
-	freeRDPAppID string
-	sessionUser  string
-	dialogBinary string
-	ctx          context.Context
-	cancel       context.CancelFunc
+	Controller                            *controller.Controller
+	vm                                    *Libvirt
+	memory                                *MemoryLibvirt
+	agent                                 Agent
+	display                               *Display
+	niriSocket, freeRDPAppID, sessionUser string
+	ctx                                   context.Context
+	cancel                                context.CancelFunc
 }
 
-// Open registers libvirt lifecycle events before the controller can issue a VM
-// query/control. Configuration is explicit; CLI/TOML and deployment stay outside.
 func Open(ctx context.Context, cfg Config) (*Session, error) {
 	if cfg.Policy.Memory != nil {
 		if err := cfg.Policy.Memory.Validate(); err != nil {
@@ -47,7 +43,7 @@ func Open(ctx context.Context, cfg Config) (*Session, error) {
 		cancel()
 		return nil, err
 	}
-	s := &Session{vm: vm, agent: Agent{Endpoint: cfg.AgentEndpoint, AuthToken: cfg.AgentToken}, niriSocket: cfg.NiriSocket, freeRDPAppID: cfg.FreeRDPAppID, ctx: ctx, cancel: cancel}
+	s := &Session{vm: vm, agent: Agent{Endpoint: cfg.AgentEndpoint, AuthToken: cfg.AgentToken}, niriSocket: cfg.NiriSocket, freeRDPAppID: cfg.FreeRDPAppID, sessionUser: cfg.Display.User, ctx: ctx, cancel: cancel}
 	if cfg.Policy.Memory != nil {
 		s.memory, err = OpenMemoryLibvirt(ctx, cfg.LibvirtSocket, cfg.LibvirtURI, cfg.Domain, cfg.MemoryAlias)
 		if err != nil {
@@ -55,31 +51,26 @@ func Open(ctx context.Context, cfg Config) (*Session, error) {
 			return nil, err
 		}
 	}
-	s.sessionUser, s.dialogBinary = cfg.Display.User, cfg.DialogBinary
-	if s.dialogBinary == "" {
-		s.dialogBinary = "rdp-launcher-dialog"
-	}
 	s.Controller = controller.New(cfg.Policy, s.execute)
-	// Background and interactive roles must not silently share a port.
-	// Backend-only sessions may leave the interactive endpoint unset.
-	s.display = NewDisplay(ctx, cfg.Display, Agent{Endpoint: cfg.InteractiveEndpoint, AuthToken: cfg.AgentToken}, s.Controller.Notify)
+	s.display = NewDisplay(ctx, cfg.Display, s.Controller.Notify)
 	return s, nil
 }
+
 func (s *Session) execute(ctx context.Context, op controller.Operation) controller.Outcome {
 	if op.Kind == controller.Dispatch {
-		if op.Request.Need == controller.Desktop || op.Request.Action == "connect" {
-			return controller.Outcome{Data: AgentResponse{Status: "ok", Message: "display process started"}}
-		}
-		client := s.agent
-		if op.Request.Need == controller.Interactive {
-			client = s.display.agent
-		}
-		response, err := client.Call(ctx, op.Request)
-		return controller.Outcome{Data: response, Err: err}
+		return s.dispatch(ctx, op)
 	}
 	if op.Kind == controller.ConfirmSwitch {
-		decision, err := chooseSwitch(ctx, s.dialogBinary, controller.SwitchPrompt{Activity: op.Activity, TargetMode: displayMode(op.Request.Need)})
-		return controller.Outcome{Decision: decision, Err: err}
+		ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		if op.Request.Choice != "" {
+			return controller.Outcome{Decision: op.Request.Choice}
+		}
+		if op.Request.Confirm == nil {
+			return controller.Outcome{Err: fmt.Errorf("request requires a choice from its originating CLI")}
+		}
+		choice, err := op.Request.Confirm(ctx, op.Prompt)
+		return controller.Outcome{Decision: choice, Err: err}
 	}
 	timeout := 15 * time.Second
 	if op.Kind == controller.StartDisplay {
@@ -112,19 +103,121 @@ func (s *Session) execute(ctx context.Context, op controller.Operation) controll
 		}
 		return s.memory.Execute(ctx, op)
 	case controller.InspectSession:
-		response, err := s.agent.call(ctx, agentRequest{Action: "inspect_session", User: s.sessionUser})
-		return controller.Outcome{Activity: response.Activity, Err: err}
+		response, err := s.agent.InspectSessions(ctx, s.sessionUser)
+		return controller.Outcome{Sessions: response.Snapshot, Err: err}
 	case controller.LogoffSession:
-		_, err := s.agent.call(ctx, agentRequest{Action: "logoff_session", User: s.sessionUser, SessionID: op.Activity.SessionID, Fingerprint: op.Activity.Fingerprint, RequireEmpty: op.RequireEmpty})
+		_, err := s.agent.call(ctx, agentRequest{Action: "logoff_session", User: s.sessionUser, SessionRef: &op.Reference})
 		return controller.Outcome{Err: err}
 	case controller.StartDisplay:
-		return controller.Outcome{Err: s.display.Start(ctx, op.ID, op.Request.Need == controller.Desktop)}
+		before, err := s.agent.InspectSessions(ctx, s.sessionUser)
+		if err != nil {
+			return controller.Outcome{Err: fmt.Errorf("pre-connection snapshot: %w", err)}
+		}
+		if before.Snapshot == nil || !before.Snapshot.Fresh {
+			return controller.Outcome{Err: fmt.Errorf("cannot start connection without a fresh baseline")}
+		}
+		if err := s.display.Start(ctx, op.ID, op.Request.Mode == controller.ModeDesktop); err != nil {
+			return controller.Outcome{Err: err}
+		}
+		binding, snapshot, err := s.waitBinding(ctx, before.Snapshot)
+		if err != nil {
+			cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_ = s.display.Stop(cleanup)
+			stop()
+		}
+		return controller.Outcome{Binding: binding, Sessions: snapshot, Err: err}
 	case controller.StopDisplay:
 		return controller.Outcome{Err: s.display.Stop(ctx)}
 	default:
 		return controller.Outcome{Err: fmt.Errorf("unsupported operation %s", op.Kind)}
 	}
 }
+
+func (s *Session) dispatch(ctx context.Context, op controller.Operation) controller.Outcome {
+	if op.Request.Action == "connect" {
+		if !op.Reference.Valid() {
+			return controller.Outcome{Err: fmt.Errorf("connection is not bound")}
+		}
+		return controller.Outcome{Data: AgentResponse{Protocol: 2, Status: "ok", Message: "display bound to user logon", SessionRef: &op.Reference}}
+	}
+	if op.Request.Action == "batch" {
+		results := make([]AgentResponse, 0, len(op.Request.Batch))
+		for index, command := range op.Request.Batch {
+			response, err := s.agent.CallInSession(ctx, command, op.Reference)
+			if err != nil {
+				return controller.Outcome{Data: map[string]any{"results": results, "completed": len(results), "failed_index": index}, Err: fmt.Errorf("batch stopped after %d of %d commands; failing command outcome may be unknown: %w", len(results), len(op.Request.Batch), err)}
+			}
+			results = append(results, response)
+		}
+		return controller.Outcome{Data: results}
+	}
+	var response AgentResponse
+	var err error
+	if op.Request.NeedsUser() {
+		response, err = s.agent.CallInSession(ctx, op.Request, op.Reference)
+	} else {
+		response, err = s.agent.Call(ctx, op.Request)
+	}
+	return controller.Outcome{Data: response, Err: err}
+}
+
+func (s *Session) waitBinding(ctx context.Context, before *controller.SessionSnapshot) (*controller.Login, *controller.SessionSnapshot, error) {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		response, err := s.agent.InspectSessions(ctx, s.sessionUser)
+		if err != nil {
+			return nil, nil, fmt.Errorf("binding session snapshot: %w", err)
+		}
+		snapshot := response.Snapshot
+		if snapshot != nil && snapshot.Fresh {
+			var selected *controller.Login
+			for _, login := range snapshot.Sessions {
+				if login.State != 0 || !login.Reference.Valid() || login.SID == "" || !strings.EqualFold(login.ClientName, s.display.config.hostname()) {
+					continue
+				}
+				if before != nil {
+					old, existed := before.Find(login.Reference)
+					if existed && old.ConnectTime == login.ConnectTime {
+						continue
+					}
+				}
+				owner := login.Domain + `\` + login.User
+				if !strings.EqualFold(login.User, s.sessionUser) && !strings.EqualFold(owner, s.sessionUser) {
+					continue
+				}
+				if selected != nil {
+					return nil, snapshot, fmt.Errorf("multiple active logons match the owned client hostname")
+				}
+				copy := login
+				selected = &copy
+			}
+			if selected != nil {
+				status, statusErr := s.agent.SessionStatus(ctx, selected.Reference)
+				if statusErr != nil {
+					return nil, snapshot, fmt.Errorf("bound user worker unavailable: %w", statusErr)
+				}
+				if status.SessionRef == nil || *status.SessionRef != selected.Reference || status.Activity == nil || status.Activity.SID != selected.SID || status.SessionActive == nil || !*status.SessionActive {
+					return nil, snapshot, fmt.Errorf("worker did not confirm the bound active logon")
+				}
+				select {
+				case <-s.display.exited:
+					return nil, snapshot, fmt.Errorf("FreeRDP exited during binding")
+				default:
+				}
+				return selected, snapshot, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, snapshot, fmt.Errorf("connection was not bound: %w", ctx.Err())
+		case <-s.display.exited:
+			return nil, snapshot, fmt.Errorf("FreeRDP exited before a matching logon was ready")
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *Session) Run() error {
 	defer s.Close()
 	group, ctx := errgroup.WithContext(s.ctx)
@@ -143,12 +236,8 @@ func (s *Session) Run() error {
 	group.Go(func() error { return s.watchBackend(ctx) })
 	return group.Wait()
 }
-
-// A VM transition owns the subscription lifetime. Running opens a new stream
-// and gets a fresh snapshot; pause/off closes it. There is no timed polling or
-// application heartbeat. Transport loss retries inside that VM-owned lifetime;
-// a VM pause/off cancels the retry and a resume starts a fresh subscription.
 func (s *Session) watchBackend(ctx context.Context) error {
+	var generations atomic.Uint64
 	var cancel context.CancelFunc
 	var ended <-chan error
 	stop := func() {
@@ -177,7 +266,10 @@ func (s *Session) watchBackend(ctx context.Context) error {
 				go func() {
 					defer stopWatch()
 					result <- retrySource(watchCtx, "backend", func(ctx context.Context) error {
-						return s.agent.Watch(ctx, s.Controller.Notify)
+						generation := generations.Add(1)
+						return s.agent.Watch(ctx, func(ctx context.Context, event controller.Event) error {
+							return s.Controller.Notify(ctx, controller.BackendStreamObserved{Generation: generation, Event: event})
+						})
 					})
 				}()
 			}
@@ -189,7 +281,6 @@ func (s *Session) watchBackend(ctx context.Context) error {
 		}
 	}
 }
-
 func (s *Session) Close() {
 	s.cancel()
 	s.vm.Close()

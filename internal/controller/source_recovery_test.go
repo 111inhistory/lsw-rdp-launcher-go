@@ -8,7 +8,7 @@ import (
 func TestVMLossWaitsForSubscriptionThenQueriesMissingState(t *testing.T) {
 	m := testMachine()
 	m.vmSource(false)
-	addJob(m, "ping", BackendOnly)
+	backgroundJob(m, "ping")
 	expectIdle(t, m, epoch)
 	if m.state.VM != VMUnknown {
 		t.Fatal(m.snapshot())
@@ -83,7 +83,7 @@ func TestMemorySourceLossSurvivesColdBootStateReset(t *testing.T) {
 	m := memoryMachine(t)
 	m.memorySource(false)
 	m.vm(VMOff)
-	addJob(m, "ping", BackendOnly)
+	backgroundJob(m, "ping")
 	expectIdle(t, m, epoch)
 	if !m.memorySourceLost || !errors.Is(m.memory.LastError, ErrMemorySourceLost) {
 		t.Fatal(m.snapshot())

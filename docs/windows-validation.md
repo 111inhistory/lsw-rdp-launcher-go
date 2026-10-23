@@ -1,6 +1,6 @@
 # Windows Agent 迁移验证记录
 
-此记录对应内存功能前的迁移轮次。后续内存变更与当前收尾状态见 [内存验证记录](memory-validation.md)。
+此记录对应内存功能前的历史迁移轮次，其中双端口与 interactive 命令属于旧协议，不能作为当前 protocol 2 / 用户 worker 的验收结论或操作说明。当前会话重构方案与新增实验见 [会话生命周期方案](session-lifecycle-redesign.md) 和 [实机实验记录](session-lifecycle-experiments.md)；新 Agent 的完整 Windows 集成验收仍待完成。后续内存变更记录见 [内存验证记录](memory-validation.md)。
 
 日期：2026-10-19。目标：本机 libvirt 的 `win11`，guest 地址 `192.0.2.14`。
 

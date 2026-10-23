@@ -34,9 +34,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: |
-            go.sum
-            cmd/rdp-launcher-dialog/go.sum
+          cache-dependency-path: go.sum
 
       - name: Install desktop serializer and native GUI dependencies
         run: |
@@ -54,22 +52,19 @@ jobs:
           fi
 
       # GUI tests use the headless tester, not a compositor or a Windows VM.
-      - name: Check main Go module
+      - name: Check Go module
         run: make check-go
 
-      - name: Check independent GUI module
-        run: make check-gui
-
-      - name: Build CLI and GUI
+      - name: Build CLI
         run: |
           make build
           ./bin/rdp-launcher version
           git diff --exit-code
 
-      - name: Package Linux binaries
+      - name: Package Linux binary
         run: |
           tar -czf rdp-launcher-linux-amd64.tar.gz \
-            -C bin rdp-launcher rdp-launcher-dialog \
+            -C bin rdp-launcher \
             -C .. config.example.toml contrib/niri-rdp-launcher.kdl LICENSE
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

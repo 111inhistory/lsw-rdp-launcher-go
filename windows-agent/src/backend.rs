@@ -1,120 +1,165 @@
-//! Resident role: no window, RDP keepalive, user-app launch or mapped-drive access.
+//! Resident background role: host TCP entry, SSH/memory observation, full WTS
+//! session snapshots, SYSTEM logoff and routing to on-demand user workers.
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::watch;
 
-use crate::{auth, memory, ssh};
+use crate::protocol::{
+    check_protocol, verify_worker_identity, ErrorResponse, HostAction, Snapshot, WorkerRequest,
+    WorkerResponse, PROTOCOL, ROLE_BACKGROUND, ROLE_USER,
+};
+use crate::{auth, memory, session, ssh, worker};
 
-#[derive(Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-enum Request {
-    Ping,
-    Status,
-    WatchStatus,
-    Quit,
-    InspectSession {
-        user: String,
-    },
-    LogoffSession {
-        user: String,
-        session_id: u32,
-        fingerprint: String,
-        #[serde(default = "require_empty_default")]
-        require_empty: bool,
-    },
-}
-fn require_empty_default() -> bool {
-    true
-}
+const LIST_APPS_WORKER_TIMEOUT: Duration = Duration::from_secs(60);
+const USER_ACTION_WORKER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn session_control_requires_both_host_and_user() {
-        let access = SessionAccess {
-            user: "user".into(),
-            host: "192.0.2.1".parse().unwrap(),
+    fn user_action_responses_carry_protocol_and_background_role() {
+        let response = WorkerResponse {
+            apps: Some(vec![crate::protocol::AppInfo {
+                id: "notepad".into(),
+                name: "Notepad".into(),
+                app_type: "win32".into(),
+                target: r"C:\Windows\notepad.exe".into(),
+                shortcut_path: None,
+                arguments: None,
+                working_dir: None,
+                icon_base64: None,
+            }]),
+            ..WorkerResponse::ok()
         };
-        assert!(access.allows("192.0.2.1".parse().unwrap(), "USER"));
-        assert!(!access.allows("127.0.0.1".parse().unwrap(), "user"));
-        assert!(!access.allows("192.0.2.1".parse().unwrap(), "other"));
-    }
-    #[test]
-    fn typed_background_request_parses_after_envelope_removal() {
-        for (wire, expected) in [
-            (
-                r#"{"action":"watch_status","token":"secret"}"#,
-                "watch_status",
-            ),
-            (r#"{"action":"quit","token":"secret"}"#, "quit"),
-        ] {
-            let mut value: serde_json::Value = serde_json::from_str(wire).unwrap();
-            auth::remove_token_field(&mut value);
-            let request = serde_json::from_value::<Request>(value).unwrap();
-            match (request, expected) {
-                (Request::WatchStatus, "watch_status") => {}
-                (Request::Quit, "quit") => {}
-                _ => panic!("unexpected request for {expected}"),
-            }
-        }
+        let value = host_response(response).unwrap();
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["protocol"], PROTOCOL);
+        assert_eq!(value["role"], ROLE_BACKGROUND);
+        assert_eq!(value["apps"][0]["id"], "notepad");
+        assert!(value.get("drives").is_none());
     }
 
     #[test]
-    fn omitted_logoff_policy_requires_empty() {
-        let request: Request = serde_json::from_str(
-            r#"{"action":"logoff_session","user":"user","session_id":2,"fingerprint":"logon"}"#,
-        )
+    fn worker_errors_stay_errors_and_report_protocol_two() {
+        let value = host_response(WorkerResponse::error("launch failed")).unwrap();
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["protocol"], PROTOCOL);
+        assert_eq!(value["role"], ROLE_BACKGROUND);
+        assert_eq!(value["message"], "launch failed");
+    }
+
+    #[test]
+    fn snapshot_response_keeps_the_approved_shape() {
+        let snapshot = Snapshot {
+            revision: 7,
+            fresh: true,
+            sessions: vec![],
+        };
+        let value = snapshot_response(snapshot);
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["protocol"], PROTOCOL);
+        assert_eq!(value["role"], ROLE_BACKGROUND);
+        assert_eq!(value["snapshot"]["revision"], 7);
+        assert_eq!(value["snapshot"]["fresh"], true);
+        assert_eq!(value["snapshot"]["sessions"], json!([]));
+    }
+
+    #[test]
+    fn session_status_response_proves_the_user_worker_identity() {
+        let reference = crate::protocol::SessionRef {
+            session_id: 4,
+            authentication_id: "0000000003C517EA".into(),
+            boot_identifier: "11111111-2222-4333-8444-555555555555".into(),
+        };
+        let status = crate::protocol::WorkerSessionStatus {
+            reference: reference.clone(),
+            session_id: 4,
+            session_active: true,
+            sid: "S-1-5-21-1".into(),
+            user: r"MACHINE\user".into(),
+            windows: Some(1),
+            tray_icons: Some(2),
+            note: None,
+        };
+        let value = user_status_response(status);
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["protocol"], PROTOCOL);
+        assert_eq!(value["role"], ROLE_USER);
+        assert_eq!(
+            value["session_ref"],
+            serde_json::to_value(&reference).unwrap()
+        );
+        assert_eq!(value["session_active"], true);
+        assert_eq!(
+            value["activity"]["reference"],
+            serde_json::to_value(&reference).unwrap()
+        );
+        assert_eq!(value["activity"]["sid"], "S-1-5-21-1");
+        assert_eq!(value["activity"]["session_id"], 4);
+        assert_eq!(value["activity"]["user"], r"MACHINE\user");
+    }
+
+    #[test]
+    fn list_apps_gets_the_longer_worker_budget_only() {
+        let inspect: HostAction = serde_json::from_value(json!({
+            "action": "list_apps",
+            "protocol": 2,
+            "session_ref": {
+                "session_id": 4,
+                "authentication_id": "0000000003C517EA",
+                "boot_identifier": "11111111-2222-4333-8444-555555555555"
+            }
+        }))
         .unwrap();
-        assert!(matches!(
-            request,
-            Request::LogoffSession {
-                require_empty: true,
-                ..
+        assert_eq!(worker_timeout(&inspect), LIST_APPS_WORKER_TIMEOUT);
+        let run: HostAction = serde_json::from_value(json!({
+            "action": "run",
+            "protocol": 2,
+            "target": "notepad.exe",
+            "session_ref": {
+                "session_id": 4,
+                "authentication_id": "0000000003C517EA",
+                "boot_identifier": "11111111-2222-4333-8444-555555555555"
             }
-        ));
-    }
-}
-
-struct SessionAccess {
-    user: String,
-    host: IpAddr,
-}
-impl SessionAccess {
-    fn allows(&self, peer: IpAddr, user: &str) -> bool {
-        self.host == peer && self.user.eq_ignore_ascii_case(user)
+        }))
+        .unwrap();
+        assert_eq!(worker_timeout(&run), USER_ACTION_WORKER_TIMEOUT);
     }
 }
 
 #[derive(Serialize)]
 struct Status {
     status: &'static str,
+    protocol: u32,
     role: &'static str,
     kind: &'static str,
     ssh_active: Option<bool>,
     memory: Option<memory::Usage>,
     source: &'static str,
+    snapshot: Snapshot,
 }
 
 pub fn run(addr: SocketAddr, args: &[String]) -> io::Result<()> {
     let option = |name: &str| {
         args.iter()
-            .position(|v| v == name)
-            .and_then(|i| args.get(i + 1))
+            .position(|value| value == name)
+            .and_then(|index| args.get(index + 1))
             .cloned()
     };
     let access = match (option("--session-user"), option("--session-host")) {
         (None, None) => None,
-        (Some(user), Some(host)) if !user.is_empty() => Some(Arc::new(SessionAccess {
+        (Some(user), Some(host)) if !user.is_empty() => Some(Arc::new(session::Access::new(
             user,
-            host: host.parse().map_err(io::Error::other)?,
-        })),
+            host.parse().map_err(io::Error::other)?,
+        )?)),
         _ => {
             return Err(io::Error::other(
                 "session management requires both --session-user and --session-host",
@@ -133,7 +178,7 @@ pub fn run(addr: SocketAddr, args: &[String]) -> io::Result<()> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(serve(addr, current, source, access, token));
-    drop(monitor); // Stops ETW and the check thread before exiting the process.
+    drop(monitor);
     result
 }
 
@@ -141,7 +186,7 @@ async fn serve(
     addr: SocketAddr,
     current: watch::Receiver<Option<bool>>,
     source: &'static str,
-    access: Option<Arc<SessionAccess>>,
+    access: Option<Arc<session::Access>>,
     token: Option<Arc<auth::Token>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
@@ -149,6 +194,16 @@ async fn serve(
     let mut samples = tokio::time::interval(Duration::from_secs(1));
     samples.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (shutdown, mut stopping) = watch::channel(false);
+    let hub = access.as_ref().map(|access| {
+        let hub = Arc::new(session::SnapshotHub::start(
+            access.sid.clone(),
+            shutdown.subscribe(),
+        ));
+        if let Err(error) = session::start_watcher(hub.signal()) {
+            log::warn!("WTS session watcher unavailable: {error}");
+        }
+        hub
+    });
     log::info!("Background listening on {addr}; SSH source={source}");
     loop {
         tokio::select! {
@@ -159,6 +214,7 @@ async fn serve(
                     access: access.clone(),
                     token: token.clone(),
                     peer: peer.ip(),
+                    hub: hub.clone(),
                 };
                 let state = current.clone();
                 let memory = memory.clone();
@@ -182,9 +238,10 @@ async fn serve(
 
 struct ConnectionContext {
     source: &'static str,
-    access: Option<Arc<SessionAccess>>,
+    access: Option<Arc<session::Access>>,
     token: Option<Arc<auth::Token>>,
     peer: IpAddr,
+    hub: Option<Arc<session::SnapshotHub>>,
 }
 
 async fn handle(
@@ -199,115 +256,187 @@ async fn handle(
         access,
         token,
         peer,
+        hub,
     } = context;
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read).take(crate::MAX_REQUEST_BYTES + 1);
     let mut line = String::new();
     tokio::time::timeout(Duration::from_secs(5), read.read_line(&mut line)).await??;
     if !line.ends_with('\n') || line.len() as u64 > crate::MAX_REQUEST_BYTES {
-        return send(
+        return send_error(
             &mut write,
-            &serde_json::json!({"status":"error","message":"incomplete or oversized request"}),
+            ErrorResponse::protocol("incomplete or oversized request"),
         )
         .await;
     }
-    let mut request: serde_json::Value = match serde_json::from_str(&line) {
+    let mut request: Value = match serde_json::from_str(&line) {
         Ok(request) => request,
-        Err(error) => return send(
-            &mut write,
-            &serde_json::json!({"status":"error","message":format!("background request: {error}")}),
-        )
-        .await,
+        Err(error) => {
+            return send_error(
+                &mut write,
+                ErrorResponse::protocol(format!("background request: {error}")),
+            )
+            .await
+        }
     };
-    let action = auth::action(&request).to_string();
+    if let Err(error) = check_protocol(&request) {
+        log::warn!("Background rejected protocol-mismatched request");
+        return send_error(&mut write, error).await;
+    }
+    let action_name = auth::action(&request).to_string();
     if !auth::authorize(&request, token.as_deref()) {
-        log::warn!("Background rejected unauthenticated request (action: {action})");
-        return send(
+        log::warn!("Background rejected unauthenticated request (action: {action_name})");
+        return send_error(
             &mut write,
-            &serde_json::json!({"status":"error","message":"authentication required"}),
+            ErrorResponse::protocol("authentication required"),
         )
         .await;
     }
     auth::remove_token_field(&mut request);
-    let request = match serde_json::from_value::<Request>(request) {
-        Ok(request) => request,
-        Err(error) => return send(
-            &mut write,
-            &serde_json::json!({"status":"error","message":format!("background request: {error}")}),
-        )
-        .await,
-    };
-    match request {
-        Request::InspectSession { user } => {
-            if !access
-                .as_ref()
-                .map(|a| a.allows(peer, &user))
-                .unwrap_or(false)
-            {
-                return send(&mut write, &serde_json::json!({"status":"error","message":"session management is not authorized for this host/user"})).await;
-            }
-            let result = tokio::task::spawn_blocking(move || crate::session::inspect(&user)).await;
-            let value = match result {
-                Ok(Ok(activity)) => {
-                    serde_json::json!({"status":"ok","role":"background","activity":activity})
-                }
-                other => {
-                    serde_json::json!({"status":"error","message":format!("session inspection failed: {other:?}")})
-                }
-            };
-            send(&mut write, &value).await
-        }
-        Request::LogoffSession {
-            user,
-            session_id,
-            fingerprint,
-            require_empty,
-        } => {
-            if !access
-                .as_ref()
-                .map(|a| a.allows(peer, &user))
-                .unwrap_or(false)
-            {
-                return send(&mut write, &serde_json::json!({"status":"error","message":"session management is not authorized for this host/user"})).await;
-            }
-            let result = tokio::task::spawn_blocking(move || {
-                crate::session::logoff(&user, session_id, &fingerprint, require_empty)
-            })
-            .await;
-            let value = match result {
-                Ok(Ok(())) => serde_json::json!({"status":"ok","role":"background"}),
-                other => {
-                    serde_json::json!({"status":"error","message":format!("session logoff failed: {other:?}")})
-                }
-            };
-            send(&mut write, &value).await
-        }
-        Request::Ping => {
-            send(
+    let action = match serde_json::from_value::<HostAction>(request) {
+        Ok(action) => action,
+        Err(error) => {
+            return send_error(
                 &mut write,
-                &serde_json::json!({"status":"ok","role":"background","message":"pong"}),
+                ErrorResponse::protocol(format!("background request: {error}")),
             )
             .await
         }
-        Request::Status => {
-            let active = *state.borrow();
-            let memory = *memory.borrow();
-            send_status(&mut write, active, memory, "snapshot", source).await
+    };
+
+    match action {
+        HostAction::InspectSessions { user } => {
+            let Some(access) = access else {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol("session management is not enabled on this agent"),
+                )
+                .await;
+            };
+            if !access.allows_optional_user(peer, user.as_deref()) {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol(
+                        "session management is not authorized for this host/user",
+                    ),
+                )
+                .await;
+            }
+            let Some(hub) = hub else {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol("session snapshot is not available"),
+                )
+                .await;
+            };
+            let snapshot = hub.inspect(session::SNAPSHOT_WAIT_TIMEOUT).await;
+            send(&mut write, &snapshot_response(snapshot)).await
         }
-        Request::Quit => {
+        HostAction::LogoffSession { user, session_ref } => {
+            let Some(access) = access else {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol("session management is not enabled on this agent"),
+                )
+                .await;
+            };
+            if !access.allows(peer, &user) {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol(
+                        "session management is not authorized for this host/user",
+                    ),
+                )
+                .await;
+            }
+            if let Err(error) = session_ref.validate() {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::with_outcome(error, "not_started"),
+                )
+                .await;
+            }
+            let sid = access.sid.clone();
+            let result =
+                tokio::task::spawn_blocking(move || session::logoff(&sid, &session_ref)).await;
+            match result {
+                Ok(result) => {
+                    let outcome = result.outcome();
+                    let message = result.message();
+                    if outcome == "confirmed" {
+                        send(
+                            &mut write,
+                            &json!({
+                                "status": "ok",
+                                "protocol": PROTOCOL,
+                                "role": ROLE_BACKGROUND,
+                                "message": message,
+                            }),
+                        )
+                        .await
+                    } else {
+                        send_error(&mut write, ErrorResponse::with_outcome(message, outcome)).await
+                    }
+                }
+                Err(error) => {
+                    send_error(
+                        &mut write,
+                        ErrorResponse::with_outcome(
+                            format!("session logoff task failed: {error}"),
+                            "unknown",
+                        ),
+                    )
+                    .await
+                }
+            }
+        }
+        HostAction::Ping => {
             send(
                 &mut write,
-                &serde_json::json!({"status":"ok","role":"background","message":"quitting"}),
+                &json!({
+                    "status": "ok",
+                    "protocol": PROTOCOL,
+                    "role": ROLE_BACKGROUND,
+                    "message": "pong",
+                }),
+            )
+            .await
+        }
+        HostAction::Status => {
+            let active = *state.borrow();
+            let memory = *memory.borrow();
+            let snapshot = hub.as_ref().map(|hub| hub.current()).unwrap_or_default();
+            send_status(&mut write, active, memory, snapshot, "snapshot", source).await
+        }
+        HostAction::Quit => {
+            send(
+                &mut write,
+                &json!({
+                    "status": "ok",
+                    "protocol": PROTOCOL,
+                    "role": ROLE_BACKGROUND,
+                    "message": "quitting",
+                }),
             )
             .await?;
             shutdown.send_replace(true);
             Ok(())
         }
-        Request::WatchStatus => {
+        HostAction::WatchStatus => {
             let initial = *state.borrow_and_update();
             let initial_memory = *memory.borrow_and_update();
-            send_status(&mut write, initial, initial_memory, "snapshot", source).await?;
+            let initial_snapshot = hub.as_ref().map(|hub| hub.current()).unwrap_or_default();
+            send_status(
+                &mut write,
+                initial,
+                initial_memory,
+                initial_snapshot,
+                "snapshot",
+                source,
+            )
+            .await?;
             let mut stopping = shutdown.subscribe();
+            let mut snapshots = hub.as_ref().map(|hub| hub.subscribe());
             loop {
                 tokio::select! {
                     changed = state.changed() => {
@@ -316,16 +445,255 @@ async fn handle(
                     changed = memory.changed() => {
                         if changed.is_err() { return Ok(()); }
                     }
+                    changed = async {
+                        match snapshots.as_mut() {
+                            Some(snapshots) => snapshots.changed().await.map_err(|_| ()),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if changed.is_err() { return Ok(()); }
+                    }
                     _ = read.read_u8() => return Ok(()), // EOF or unexpected extra request.
                     _ = stopping.changed() => return Ok(()),
                 }
-                // Both watchers only publish meaningful changes, so each frame
-                // carries the current value of both observations.
                 let active = *state.borrow_and_update();
                 let memory = *memory.borrow_and_update();
-                send_status(&mut write, active, memory, "changed", source).await?;
+                if let Some(snapshots) = snapshots.as_mut() {
+                    snapshots.borrow_and_update();
+                }
+                let snapshot = hub.as_ref().map(|hub| hub.current()).unwrap_or_default();
+                send_status(&mut write, active, memory, snapshot, "changed", source).await?;
             }
         }
+        HostAction::SessionStatus { session_ref } => {
+            let Some(access) = access else {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol("session management is not enabled on this agent"),
+                )
+                .await;
+            };
+            if !access.allows_host(peer) {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol("session management is not authorized for this host"),
+                )
+                .await;
+            }
+            if let Err(error) = session_ref.validate() {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol(format!("invalid session_ref: {error}")),
+                )
+                .await;
+            }
+            let sid = access.sid.clone();
+            let response_sid = sid.clone();
+            let response_reference = session_ref.clone();
+            let deadline = Instant::now() + USER_ACTION_WORKER_TIMEOUT;
+            let result = tokio::task::spawn_blocking(move || {
+                session::verify_reference(&session_ref, &sid)?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "session status expired after identity verification",
+                    ));
+                }
+                worker::execute(
+                    session_ref.session_id,
+                    &sid,
+                    &session_ref,
+                    WorkerRequest::SessionStatus,
+                    remaining,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(response)) if response.status == "ok" => {
+                    let status = match response.session {
+                        Some(status) => status,
+                        None => {
+                            return send_error(
+                                &mut write,
+                                ErrorResponse::protocol("user worker returned no session status"),
+                            )
+                            .await
+                        }
+                    };
+                    if let Err(error) = verify_worker_identity(
+                        &response_reference,
+                        &response_sid,
+                        &status.reference,
+                        &status.sid,
+                    ) {
+                        return send_error(
+                            &mut write,
+                            ErrorResponse::protocol(format!(
+                                "user worker identity does not match the verified session_ref:                                  {error}"
+                            )),
+                        )
+                        .await;
+                    }
+                    send(&mut write, &user_status_response(status)).await
+                }
+                Ok(Ok(response)) => {
+                    send_error(
+                        &mut write,
+                        ErrorResponse::protocol(
+                            response
+                                .message
+                                .unwrap_or_else(|| "user worker status failed".into()),
+                        ),
+                    )
+                    .await
+                }
+                Ok(Err(error)) => {
+                    send_error(
+                        &mut write,
+                        ErrorResponse::protocol(format!("user session status failed: {error}")),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    send_error(
+                        &mut write,
+                        ErrorResponse::protocol(format!(
+                            "user session status task failed: {error}"
+                        )),
+                    )
+                    .await
+                }
+            }
+        }
+        action @ (HostAction::Run { .. }
+        | HostAction::Open { .. }
+        | HostAction::ListApps { .. }
+        | HostAction::GetMappedDrives { .. }) => {
+            let Some(access) = access else {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol("session management is not enabled on this agent"),
+                )
+                .await;
+            };
+            if !access.allows_host(peer) {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol("session management is not authorized for this host"),
+                )
+                .await;
+            }
+            let Some(reference) = action.session_ref().cloned() else {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol("request is missing session_ref"),
+                )
+                .await;
+            };
+            if let Err(error) = reference.validate() {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol(format!("invalid session_ref: {error}")),
+                )
+                .await;
+            }
+            let timeout = worker_timeout(&action);
+            let Some(worker_request) = Option::<WorkerRequest>::from(action) else {
+                return send_error(
+                    &mut write,
+                    ErrorResponse::protocol("unsupported user action"),
+                )
+                .await;
+            };
+            let sid = access.sid.clone();
+            let deadline = Instant::now() + timeout;
+            let result = tokio::task::spawn_blocking(move || {
+                session::verify_reference(&reference, &sid)?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "user action expired after identity verification",
+                    ));
+                }
+                worker::execute(
+                    reference.session_id,
+                    &sid,
+                    &reference,
+                    worker_request,
+                    remaining,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(response)) => match host_response(response) {
+                    Ok(value) => send(&mut write, &value).await,
+                    Err(error) => {
+                        send_error(&mut write, ErrorResponse::protocol(error.to_string())).await
+                    }
+                },
+                Ok(Err(error)) => {
+                    send_error(
+                        &mut write,
+                        ErrorResponse::protocol(format!("user session action failed: {error}")),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    send_error(
+                        &mut write,
+                        ErrorResponse::protocol(format!("user session task failed: {error}")),
+                    )
+                    .await
+                }
+            }
+        }
+    }
+}
+
+fn snapshot_response(snapshot: Snapshot) -> Value {
+    json!({
+        "status": "ok",
+        "protocol": PROTOCOL,
+        "role": ROLE_BACKGROUND,
+        "snapshot": snapshot,
+    })
+}
+
+fn user_status_response(status: crate::protocol::WorkerSessionStatus) -> Value {
+    let reference = &status.reference;
+    json!({
+        "status": "ok",
+        "protocol": PROTOCOL,
+        "role": ROLE_USER,
+        "session_ref": reference,
+        "session_active": status.session_active,
+        "activity": {
+            "reference": reference,
+            "sid": status.sid,
+            "session_id": status.session_id,
+            "user": status.user,
+            "windows": status.windows,
+            "tray_icons": status.tray_icons,
+            "note": status.note,
+        },
+    })
+}
+
+fn host_response(response: WorkerResponse) -> serde_json::Result<Value> {
+    let mut value = serde_json::to_value(response)?;
+    if let Value::Object(fields) = &mut value {
+        fields.insert("protocol".into(), json!(PROTOCOL));
+        fields.insert("role".into(), json!(ROLE_BACKGROUND));
+    }
+    Ok(value)
+}
+
+fn worker_timeout(action: &HostAction) -> Duration {
+    match action {
+        HostAction::ListApps { .. } => LIST_APPS_WORKER_TIMEOUT,
+        _ => USER_ACTION_WORKER_TIMEOUT,
     }
 }
 
@@ -333,6 +701,7 @@ async fn send_status(
     write: &mut OwnedWriteHalf,
     active: Option<bool>,
     memory: Option<memory::Usage>,
+    snapshot: Snapshot,
     kind: &'static str,
     source: &'static str,
 ) -> io::Result<()> {
@@ -340,15 +709,22 @@ async fn send_status(
         write,
         &Status {
             status: "ok",
-            role: "background",
+            protocol: PROTOCOL,
+            role: ROLE_BACKGROUND,
             kind,
             ssh_active: active,
             memory,
             source,
+            snapshot,
         },
     )
     .await
 }
+
+async fn send_error(write: &mut OwnedWriteHalf, error: ErrorResponse) -> io::Result<()> {
+    send(write, &error).await
+}
+
 async fn send(write: &mut OwnedWriteHalf, value: &impl Serialize) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');

@@ -279,7 +279,14 @@ func (m *machine) memoryExpire(now time.Time) {
 func (m *machine) memorySet(target uint64, now time.Time) *Operation {
 	mem := &m.memory
 	continuing := mem.Awaiting && target > 0 && target == mem.TargetBytes
-	op := m.beginMemory(SetMemory)
+	source := SourcePressure
+	if target == 0 {
+		source = SourceIdle
+	}
+	op := m.beginMemory(SetMemory, source)
+	if op == nil {
+		return nil
+	}
 	op.MemoryTarget = target
 	if continuing {
 		mem.pokes++
@@ -304,7 +311,7 @@ func (m *machine) memoryNext(now time.Time) *Operation {
 	}
 	if !mem.DeviceKnown && (mem.LastError == nil || mem.needQuery) {
 		mem.needQuery = false
-		return m.beginMemory(QueryMemory)
+		return m.beginMemory(QueryMemory, SourcePressure)
 	}
 	if mem.LastError != nil {
 		return nil
@@ -313,8 +320,12 @@ func (m *machine) memoryNext(now time.Time) *Operation {
 		return nil
 	}
 	if !mem.WindowPrepared {
+		if m.state.Locked {
+			m.state.BlockingReason = "memory initialization requires pause; unlock before preparation"
+			return nil
+		}
 		mem.phase = memoryPausing
-		return m.begin(SuspendVM, nil)
+		return m.begin(SuspendVM, nil, SourcePressure)
 	}
 	if !mem.Growing {
 		return nil
@@ -342,7 +353,7 @@ func (m *machine) memoryNext(now time.Time) *Operation {
 }
 func (m *machine) memoryReclaim(now time.Time) *Operation {
 	mem := &m.memory
-	if m.opts.Memory == nil || mem.LastError != nil || !mem.DeviceKnown || !mem.GuestKnown || mem.Growing ||
+	if m.state.Locked || m.opts.Memory == nil || mem.LastError != nil || !mem.DeviceKnown || !mem.GuestKnown || mem.Growing ||
 		m.state.SuspendDeadline.IsZero() || mem.reclaimedFor == m.state.SuspendDeadline {
 		return nil
 	}
@@ -392,12 +403,15 @@ func uiOperation(kind Kind) bool {
 
 // Only UI/RPC work may overlap memory I/O. All VM mutations still share one
 // control slot; preparation finishes before the first UI operation can start.
-func (m *machine) beginMemory(kind Kind) *Operation {
+func (m *machine) beginMemory(kind Kind, source OperationSource) *Operation {
 	if m.busy == nil {
-		return m.begin(kind, nil)
+		return m.begin(kind, nil, source)
 	}
 	ui := m.busy
-	op := m.begin(kind, nil)
+	op := m.begin(kind, nil, source)
+	if op == nil {
+		return nil
+	}
 	m.busy, m.memoryBusy = ui, op
 	return op
 }
@@ -413,11 +427,11 @@ func (m *machine) memoryPreparationNext() *Operation {
 	switch m.memory.phase {
 	case memoryWindow:
 		if m.state.VM == VMPaused {
-			return m.begin(PrepareMemory, nil)
+			return m.begin(PrepareMemory, nil, SourceRecovery)
 		}
 	case memoryResuming:
 		if m.state.VM == VMPaused {
-			return m.begin(WakeVM, nil)
+			return m.begin(WakeVM, nil, SourceRecovery)
 		}
 	}
 	m.memoryAbort(fmt.Errorf("unexpected VM state %s during memory preparation", m.state.VM))

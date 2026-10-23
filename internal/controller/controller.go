@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
 )
@@ -36,19 +37,28 @@ type MemoryDeviceObserved struct {
 	Lost        bool
 }
 type WindowsObserved struct{ Count int }
+type SessionsObserved struct{ Snapshot SessionSnapshot }
+
+// BackendStreamObserved fences late events from canceled/replaced subscriptions.
+type BackendStreamObserved struct {
+	Generation uint64
+	Event      Event
+}
 type DisplayExited struct {
 	OperationID uint64
 	Err         error
 }
 
-func (VMObserved) controllerEvent()           {}
-func (VMSourceObserved) controllerEvent()     {}
-func (MemorySourceObserved) controllerEvent() {}
-func (BackendObserved) controllerEvent()      {}
-func (MemoryObserved) controllerEvent()       {}
-func (MemoryDeviceObserved) controllerEvent() {}
-func (WindowsObserved) controllerEvent()      {}
-func (DisplayExited) controllerEvent()        {}
+func (VMObserved) controllerEvent()            {}
+func (VMSourceObserved) controllerEvent()      {}
+func (MemorySourceObserved) controllerEvent()  {}
+func (BackendObserved) controllerEvent()       {}
+func (MemoryObserved) controllerEvent()        {}
+func (MemoryDeviceObserved) controllerEvent()  {}
+func (WindowsObserved) controllerEvent()       {}
+func (SessionsObserved) controllerEvent()      {}
+func (BackendStreamObserved) controllerEvent() {}
+func (DisplayExited) controllerEvent()         {}
 
 type queueWake struct{}
 
@@ -104,6 +114,9 @@ func (c *Controller) Notify(ctx context.Context, event Event) error {
 	return c.send(ctx, event)
 }
 func (c *Controller) Do(ctx context.Context, req Request) Result {
+	if err := req.Validate(); err != nil {
+		return Result{Err: err}
+	}
 	j := &job{request: req, ctx: ctx, reply: make(chan Result, 1)}
 	if err := c.send(ctx, j); err != nil {
 		return Result{Err: err}
@@ -167,7 +180,20 @@ func (c *Controller) Run(ctx context.Context) error {
 		}
 		workers.Wait()
 	}()
-	apply := func(event any) {
+	var apply func(any)
+	apply = func(event any) {
+		if stream, ok := event.(BackendStreamObserved); ok {
+			if stream.Generation < m.backendStreamGeneration || (stream.Generation == m.backendStreamGeneration && m.backendStreamInvalid) {
+				return
+			}
+			if stream.Generation > m.backendStreamGeneration {
+				m.backendStreamGeneration = stream.Generation
+				m.backendStreamInvalid = false
+				m.invalidateSessions()
+			}
+			apply(stream.Event)
+			return
+		}
 		switch e := event.(type) {
 		case queueWake: // Re-evaluate canceled jobs before choosing another operation.
 		case *job:
@@ -189,9 +215,12 @@ func (c *Controller) Run(ctx context.Context) error {
 			m.memoryDevice(e)
 		case WindowsObserved:
 			m.windows(e.Count)
+		case SessionsObserved:
+			m.sessions(e.Snapshot)
 		case DisplayExited:
 			m.displayExited(e.OperationID, e.Err)
 		case operationDone:
+			log.Printf("operation result id=%d error=%v", e.id, e.out.Err)
 			if cancel := cancelOperations[e.id]; cancel != nil {
 				cancel()
 				delete(cancelOperations, e.id)
@@ -234,6 +263,13 @@ func (c *Controller) Run(ctx context.Context) error {
 				item.job.reply <- item.result
 			}
 			if op != nil {
+				task := op.ID
+				if op.job != nil {
+					task = op.job.id
+				} else if op.Source == SourceIdle {
+					task = op.idleGeneration
+				}
+				log.Printf("operation start id=%d task=%s-%d kind=%s source=%s session=%d logon=%s action=%s", op.ID, op.Source, task, op.Kind, op.Source, op.Reference.SessionID, op.Reference.AuthenticationID, op.Request.Action)
 				opCtx, cancel := context.WithCancel(ctx)
 				cancelOperations[op.ID] = cancel
 				var stop func() bool

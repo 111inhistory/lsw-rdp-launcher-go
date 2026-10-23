@@ -89,7 +89,7 @@ func TestLiveMemoryReclaimSuspendResume(t *testing.T) {
 	if err := session.Controller.SetLocked(ctx, true); err != nil {
 		t.Fatal(err)
 	}
-	result = session.Controller.Do(ctx, controller.Request{Action: "status", Need: controller.BackendOnly})
+	result = session.Controller.Do(ctx, controller.Request{Action: "status"})
 	if result.Err != nil {
 		t.Fatal(result.Err)
 	}

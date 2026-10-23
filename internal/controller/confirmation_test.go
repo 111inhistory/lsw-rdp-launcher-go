@@ -8,7 +8,7 @@ import (
 func TestVMCommandAckDoesNotChangeState(t *testing.T) {
 	m := testMachine()
 	m.vm(VMPaused)
-	addJob(m, "run", Interactive)
+	addJob(m, "run", ModeRemoteApp)
 	op := expectOp(t, m, epoch, WakeVM)
 	m.done(op.ID, Outcome{}, epoch)
 	if s := m.snapshot(); s.VM != VMPaused || s.AwaitingVM != VMRunning {
@@ -16,22 +16,24 @@ func TestVMCommandAckDoesNotChangeState(t *testing.T) {
 	}
 	expectIdle(t, m, epoch.Add(time.Second))
 	m.vm(VMRunning)
+	m.backend(true, SSHZero)
 	expectOp(t, m, epoch.Add(time.Second), StartDisplay)
 }
 func TestVMConfirmationCanPrecedeAck(t *testing.T) {
 	m := testMachine()
 	m.vm(VMPaused)
-	addJob(m, "run", Interactive)
+	addJob(m, "run", ModeRemoteApp)
 	op := expectOp(t, m, epoch, WakeVM)
 	m.vm(VMRunning)
 	expectIdle(t, m, epoch) // Control call still owns the slot until it returns.
 	m.done(op.ID, Outcome{}, epoch)
+	m.backend(true, SSHZero)
 	expectOp(t, m, epoch, StartDisplay)
 }
 func TestUnrelatedStateIsNotConfirmation(t *testing.T) {
 	m := testMachine()
 	m.vm(VMPaused)
-	addJob(m, "run", Interactive)
+	addJob(m, "run", ModeRemoteApp)
 	op := expectOp(t, m, epoch, WakeVM)
 	m.done(op.ID, Outcome{}, epoch)
 	m.vm(VMOff)
@@ -41,10 +43,10 @@ func TestUnrelatedStateIsNotConfirmation(t *testing.T) {
 	expectIdle(t, m, epoch.Add(time.Second))
 }
 func TestLoopConfirmationTimeoutDoesNotPoll(t *testing.T) {
-	h := newHarness(t, Options{VMConfirmTimeout: 10 * time.Millisecond})
+	h := newHarness(t, Options{VMConfirmTimeout: 10 * time.Millisecond, IdleLogoff: -time.Second})
 	h.notify(t, VMObserved{VMPaused})
 	h.wait(t, func(s Snapshot) bool { return s.VM == VMPaused })
-	result := h.request(h.ctx, Request{Action: "background", Need: BackendOnly})
+	result := h.request(h.ctx, Request{Action: "background"})
 	h.expect(t, WakeVM)
 	h.complete(t, Outcome{})
 	if r := h.reply(t, result); r.Err == nil {
@@ -61,7 +63,7 @@ func TestLoopLifecycleBeforeAckPreservesBackendObservation(t *testing.T) {
 	h := newHarness(t)
 	h.notify(t, VMObserved{VMPaused})
 	h.wait(t, func(s Snapshot) bool { return s.VM == VMPaused })
-	result := h.request(h.ctx, Request{Action: "background", Need: BackendOnly})
+	result := h.request(h.ctx, Request{Action: "background"})
 	h.expect(t, WakeVM)
 	h.notify(t, VMObserved{VMRunning})
 	h.notify(t, BackendObserved{true, SSHZero})
@@ -78,7 +80,7 @@ func TestLoopWaitsForLifecycleAfterAck(t *testing.T) {
 	h := newHarness(t)
 	h.notify(t, VMObserved{VMPaused})
 	h.wait(t, func(s Snapshot) bool { return s.VM == VMPaused })
-	result := h.request(h.ctx, Request{Action: "background", Need: BackendOnly})
+	result := h.request(h.ctx, Request{Action: "background"})
 	h.expect(t, WakeVM)
 	h.complete(t, Outcome{})
 	h.wait(t, func(s Snapshot) bool { return s.AwaitingVM == VMRunning })

@@ -1,9 +1,10 @@
-//! Shared-token authentication for both Windows TCP endpoints.
+//! Shared-token authentication for the host-facing TCP backend endpoint.
 //!
 //! The token itself never enters argv or logs: the process receives a file path
 //! once at startup, loads the token, and compares each request's `token` field
 //! in constant time. This is authentication for a controlled plaintext network,
-//! not transport encryption.
+//! not transport encryption. User workers use a local named pipe and do not
+//! receive the shared token.
 
 use std::io;
 use std::net::SocketAddr;
@@ -182,18 +183,18 @@ mod tests {
 
     #[test]
     fn non_loopback_bind_requires_a_token_file() {
-        let error = match load_for_bind(bind("192.0.2.10:49152"), None) {
+        let error = match load_for_bind(bind("192.0.2.10:49153"), None) {
             Err(error) => error,
             Ok(_) => panic!("non-loopback bind started without a token"),
         };
         assert!(error.to_string().contains("--auth-token-file"));
-        assert!(load_for_bind(bind("127.0.0.1:49152"), None)
+        assert!(load_for_bind(bind("127.0.0.1:49153"), None)
             .unwrap()
             .is_none());
-        assert!(load_for_bind(bind("[::1]:49152"), None).unwrap().is_none());
+        assert!(load_for_bind(bind("[::1]:49153"), None).unwrap().is_none());
 
         let (path, _) = token_file(b"token");
-        assert!(load_for_bind(bind("192.0.2.10:49152"), Some(&path))
+        assert!(load_for_bind(bind("192.0.2.10:49153"), Some(&path))
             .unwrap()
             .is_some());
         std::fs::remove_file(path).unwrap();
@@ -202,9 +203,9 @@ mod tests {
     #[test]
     fn parses_the_flag_once_and_requires_its_value() {
         let args = vec![
-            "daemon".to_string(),
+            "backend".to_string(),
             "--bind".to_string(),
-            "127.0.0.1:49152".to_string(),
+            "127.0.0.1:49153".to_string(),
             "--auth-token-file".to_string(),
             r"C:\ProgramData\rdp-launcher\agent-token".to_string(),
         ];
@@ -212,8 +213,8 @@ mod tests {
             token_file_arg(&args).unwrap().unwrap(),
             PathBuf::from(r"C:\ProgramData\rdp-launcher\agent-token")
         );
-        assert!(token_file_arg(&["daemon".to_string()]).unwrap().is_none());
-        assert!(token_file_arg(&["daemon".to_string(), "--auth-token-file".to_string()]).is_err());
+        assert!(token_file_arg(&["backend".to_string()]).unwrap().is_none());
+        assert!(token_file_arg(&["backend".to_string(), "--auth-token-file".to_string()]).is_err());
     }
 
     #[test]
@@ -249,8 +250,9 @@ mod tests {
             "open",
             "list_apps",
             "get_mapped_drives",
-            "inspect_session",
+            "inspect_sessions",
             "logoff_session",
+            "session_status",
         ] {
             assert!(
                 authorize(
@@ -288,20 +290,22 @@ mod tests {
     #[test]
     fn typed_requests_parse_after_the_envelope_field_is_removed() {
         let mut ping: Value =
-            serde_json::from_str(r#"{"action":"ping","token":"secret"}"#).unwrap();
+            serde_json::from_str(r#"{"action":"ping","protocol":2,"token":"secret"}"#).unwrap();
         remove_token_field(&mut ping);
         assert!(matches!(
-            serde_json::from_value::<crate::AgentRequest>(ping).unwrap(),
-            crate::AgentRequest::Ping
+            serde_json::from_value::<crate::protocol::HostAction>(ping).unwrap(),
+            crate::protocol::HostAction::Ping
         ));
 
         let mut run: Value = serde_json::from_str(
-            r#"{"action":"run","token":"secret","target":"notepad.exe","params":null}"#,
+            r#"{"action":"run","protocol":2,"token":"secret","target":"notepad.exe","params":null,"session_ref":{"session_id":4,"authentication_id":"0000000003C517EA","boot_identifier":"11111111-2222-4333-8444-555555555555"}}"#,
         )
         .unwrap();
         remove_token_field(&mut run);
-        match serde_json::from_value::<crate::AgentRequest>(run).unwrap() {
-            crate::AgentRequest::Run { target, .. } => assert_eq!(target, "notepad.exe"),
+        match serde_json::from_value::<crate::protocol::HostAction>(run).unwrap() {
+            crate::protocol::HostAction::Run { target, .. } => {
+                assert_eq!(target, "notepad.exe")
+            }
             other => panic!("unexpected request: {other:?}"),
         }
     }

@@ -4,6 +4,7 @@ package host
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -27,22 +28,20 @@ type Config struct {
 		Host, User, Service string
 		AgentService        string `toml:"agent_service"`
 		AgentTokenFile      string `toml:"agent_token_file"`
-		AgentPort           int    `toml:"agent_port"`
+		LegacyAgentPort     *int   `toml:"agent_port"`
 		BackendPort         int    `toml:"backend_port"`
 	}
 	Libvirt struct{ Socket, URI string }
 	FreeRDP struct {
-		Bin          string
-		AppID        string `toml:"app_id"`
-		VideoDriver  string `toml:"video_driver"`
-		ScaleDesktop int    `toml:"scale_desktop"`
-		Clipboard    bool
-		CertIgnore   bool              `toml:"cert_ignore"`
-		ExtraArgs    []string          `toml:"extra_args"`
-		Env          map[string]string `toml:"env"`
-	}
-	UI struct {
-		DialogBinary string `toml:"dialog_bin"`
+		Bin            string
+		AppID          string `toml:"app_id"`
+		ClientHostname string `toml:"client_hostname"`
+		VideoDriver    string `toml:"video_driver"`
+		ScaleDesktop   int    `toml:"scale_desktop"`
+		Clipboard      bool
+		CertIgnore     bool              `toml:"cert_ignore"`
+		ExtraArgs      []string          `toml:"extra_args"`
+		Env            map[string]string `toml:"env"`
 	}
 	RemoteApp struct {
 		DefaultApp string `toml:"default_app"`
@@ -50,6 +49,7 @@ type Config struct {
 	Lifecycle struct {
 		VMName         string `toml:"vm_name"`
 		IdleDisconnect int    `toml:"idle_disconnect_timeout"`
+		IdleLogoff     int    `toml:"idle_logoff_timeout"`
 		VMSuspend      int    `toml:"vm_suspend_timeout"`
 		MemoryAlias    string `toml:"virtio_mem_alias"`
 	}
@@ -81,16 +81,17 @@ func DefaultSocket() string {
 func LoadConfig(path string) (Config, error) {
 	var c Config
 	c.Server.Service = "rdp-bridge"
-	c.Server.AgentPort = 49152
 	c.Server.BackendPort = 49153
 	c.Libvirt.Socket = "/run/libvirt/libvirt-sock"
 	c.Libvirt.URI = "qemu:///system"
 	c.FreeRDP.Bin = "sdl-freerdp"
 	c.FreeRDP.AppID = adapter.DefaultFreeRDPAppID
+	c.FreeRDP.ClientHostname = "rdp-launcher"
 	c.FreeRDP.Clipboard = true
 	c.RemoteApp.DefaultApp = "remoteapp-launcher.exe"
 	c.Lifecycle.VMName = "win11"
 	c.Lifecycle.IdleDisconnect = 30
+	c.Lifecycle.IdleLogoff = -1
 	c.Lifecycle.VMSuspend = 300
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -98,6 +99,9 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if err = toml.Unmarshal(data, &c); err != nil {
 		return c, err
+	}
+	if c.Server.LegacyAgentPort != nil {
+		return c, fmt.Errorf("server.agent_port is removed; the interactive endpoint is obsolete, configure server.backend_port instead")
 	}
 	if c.Server.AgentService == "" {
 		c.Server.AgentService = c.Server.Service + "-agent"
@@ -123,13 +127,40 @@ func (c Config) Adapter() (adapter.Config, error) {
 	if net.ParseIP(c.Server.Host) == nil {
 		return adapter.Config{}, fmt.Errorf("server.host must be an explicit guest IP")
 	}
-	if c.Server.AgentPort <= 0 || c.Server.AgentPort > 65535 || c.Server.BackendPort <= 0 || c.Server.BackendPort > 65535 || c.Server.AgentPort == c.Server.BackendPort {
-		return adapter.Config{}, fmt.Errorf("agent_port and backend_port must be distinct TCP ports")
+	if c.Server.LegacyAgentPort != nil {
+		return adapter.Config{}, fmt.Errorf("server.agent_port is removed; the interactive endpoint is obsolete, configure server.backend_port instead")
 	}
+	if c.Server.BackendPort <= 0 || c.Server.BackendPort > 65535 {
+		return adapter.Config{}, fmt.Errorf("backend_port must be a valid TCP port (1-65535)")
+	}
+	hostname := c.FreeRDP.ClientHostname
+	if hostname == "" {
+		hostname = "rdp-launcher"
+	}
+	if len(hostname) > 15 || !isASCII(hostname) {
+		return adapter.Config{}, fmt.Errorf("freerdp.client_hostname must be 1-15 printable ASCII characters without whitespace")
+	}
+	const maxDurationSeconds = int64(math.MaxInt64 / time.Second)
 	if c.Lifecycle.IdleDisconnect < 0 || c.Lifecycle.VMSuspend < 0 {
 		return adapter.Config{}, fmt.Errorf("idle timeouts cannot be negative")
 	}
-	policy := controller.Options{IdleDisconnect: time.Duration(c.Lifecycle.IdleDisconnect) * time.Second, VMSuspend: time.Duration(c.Lifecycle.VMSuspend) * time.Second}
+	if int64(c.Lifecycle.IdleDisconnect) > maxDurationSeconds || int64(c.Lifecycle.VMSuspend) > maxDurationSeconds {
+		return adapter.Config{}, fmt.Errorf("idle timeout duration overflow")
+	}
+	if c.Lifecycle.IdleLogoff < -1 {
+		return adapter.Config{}, fmt.Errorf("idle_logoff_timeout cannot be less than -1")
+	}
+	if int64(c.Lifecycle.IdleLogoff) > maxDurationSeconds {
+		return adapter.Config{}, fmt.Errorf("idle_logoff_timeout duration overflow")
+	}
+	if c.Lifecycle.VMSuspend > 0 && c.Lifecycle.IdleLogoff > c.Lifecycle.VMSuspend {
+		return adapter.Config{}, fmt.Errorf("idle_logoff_timeout (%d) cannot exceed vm_suspend_timeout (%d)", c.Lifecycle.IdleLogoff, c.Lifecycle.VMSuspend)
+	}
+	policy := controller.Options{
+		IdleDisconnect: time.Duration(c.Lifecycle.IdleDisconnect) * time.Second,
+		IdleLogoff:     time.Duration(c.Lifecycle.IdleLogoff) * time.Second,
+		VMSuspend:      time.Duration(c.Lifecycle.VMSuspend) * time.Second,
+	}
 	if c.Memory != nil {
 		policy.Memory = &controller.MemoryPolicy{StartPercent: c.Memory.StartPercent, StopPercent: c.Memory.StopPercent}
 		if err := policy.Memory.Validate(); err != nil {
@@ -138,13 +169,26 @@ func (c Config) Adapter() (adapter.Config, error) {
 	}
 	return adapter.Config{
 		LibvirtSocket: c.Libvirt.Socket, LibvirtURI: c.Libvirt.URI, Domain: c.Lifecycle.VMName,
-		DialogBinary:        c.UI.DialogBinary,
-		AgentEndpoint:       net.JoinHostPort(c.Server.Host, strconv.Itoa(c.Server.BackendPort)),
-		InteractiveEndpoint: net.JoinHostPort(c.Server.Host, strconv.Itoa(c.Server.AgentPort)),
-		NiriSocket:          os.Getenv("NIRI_SOCKET"), FreeRDPAppID: c.FreeRDP.AppID, MemoryAlias: c.Lifecycle.MemoryAlias, Policy: policy,
+		AgentEndpoint: net.JoinHostPort(c.Server.Host, strconv.Itoa(c.Server.BackendPort)),
+		NiriSocket:    os.Getenv("NIRI_SOCKET"), FreeRDPAppID: c.FreeRDP.AppID, MemoryAlias: c.Lifecycle.MemoryAlias, Policy: policy,
 		AgentToken: c.AgentToken,
-		Display:    adapter.DisplayConfig{Binary: c.FreeRDP.Bin, Host: c.Server.Host, User: c.Server.User, Program: c.RemoteApp.DefaultApp, VideoDriver: c.FreeRDP.VideoDriver, ScaleDesktop: c.FreeRDP.ScaleDesktop, Clipboard: c.FreeRDP.Clipboard, IgnoreCertificate: c.FreeRDP.CertIgnore, ExtraArgs: c.FreeRDP.ExtraArgs, Env: c.FreeRDP.Env, AgentTokenFile: c.Server.AgentTokenFile, Log: os.Stderr, Password: c.Password},
+		Display: adapter.DisplayConfig{
+			Binary: c.FreeRDP.Bin, Host: c.Server.Host, User: c.Server.User, Program: c.RemoteApp.DefaultApp,
+			ClientHostname: hostname,
+			VideoDriver:    c.FreeRDP.VideoDriver, ScaleDesktop: c.FreeRDP.ScaleDesktop, Clipboard: c.FreeRDP.Clipboard,
+			IgnoreCertificate: c.FreeRDP.CertIgnore, ExtraArgs: c.FreeRDP.ExtraArgs, Env: c.FreeRDP.Env,
+			Log: os.Stderr, Password: c.Password,
+		},
 	}, nil
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 33 || s[i] > 126 {
+			return false
+		}
+	}
+	return true
 }
 
 // The selectors match the existing Rust keyring's service/username attributes.

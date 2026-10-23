@@ -15,7 +15,7 @@ func TestAgentMemoryNotificationAndNull(t *testing.T) {
 	a := watchAgent(t, func(conn net.Conn) {
 		encoder := json.NewEncoder(conn)
 		for _, memory := range []any{map[string]any{"total_bytes": 4000, "available_bytes": 200, "low": true}, nil} {
-			if err := encoder.Encode(map[string]any{"status": "ok", "kind": "changed", "ssh_active": false, "memory": memory}); err != nil {
+			if err := encoder.Encode(map[string]any{"protocol": agentProtocol, "status": "ok", "kind": "changed", "ssh_active": false, "memory": memory}); err != nil {
 				t.Error(err)
 				return
 			}
@@ -44,7 +44,7 @@ func TestAgentMemoryNotificationAndNull(t *testing.T) {
 }
 func TestAgentStatusIncludesMemory(t *testing.T) {
 	a := jsonAgent(t, func(agentRequest) any {
-		return map[string]any{"status": "ok", "role": "background", "memory": map[string]any{"total_bytes": 4000, "available_bytes": 2000, "low": false}}
+		return map[string]any{"protocol": agentProtocol, "status": "ok", "role": "background", "memory": map[string]any{"total_bytes": 4000, "available_bytes": 2000, "low": false}}
 	})
 	out, err := a.Call(context.Background(), controller.Request{Action: "status"})
 	if err != nil || out.Memory == nil || out.Memory.TotalBytes != 4000 || out.Memory.AvailableBytes != 2000 {
@@ -53,7 +53,7 @@ func TestAgentStatusIncludesMemory(t *testing.T) {
 }
 func TestAgentMalformedMemoryInvalidatesBackend(t *testing.T) {
 	a := watchAgent(t, func(conn net.Conn) {
-		_ = json.NewEncoder(conn).Encode(map[string]any{"status": "ok", "memory": map[string]any{"total_bytes": "bad"}})
+		_ = json.NewEncoder(conn).Encode(map[string]any{"protocol": agentProtocol, "status": "ok", "memory": map[string]any{"total_bytes": "bad"}})
 	})
 	var seen []controller.BackendObserved
 	err := a.Watch(context.Background(), func(_ context.Context, event controller.Event) error {

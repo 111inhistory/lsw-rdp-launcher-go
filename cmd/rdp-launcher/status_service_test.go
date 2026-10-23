@@ -32,47 +32,43 @@ func statusController(t *testing.T, socket string, data string) {
 			}
 			go func() {
 				defer conn.Close()
+				decoder, encoder := json.NewDecoder(conn), json.NewEncoder(conn)
+				if !hostGreeting(t, decoder, encoder) {
+					return
+				}
 				var request host.Request
-				if json.NewDecoder(conn).Decode(&request) != nil {
+				if decoder.Decode(&request) != nil {
 					return
 				}
 				if request.Action != "status" {
 					t.Error("local operation sent a non-status request", request.Action)
 				}
-				json.NewEncoder(conn).Encode(host.Response{Data: json.RawMessage(data)})
+				_ = encoder.Encode(host.Response{Type: "result", Data: json.RawMessage(data)})
 			}()
 		}
 	}()
 }
 
-func TestHumanStatusAndJSONIncludeVersion(t *testing.T) {
+func TestHumanStatusIncludesVersionAndRejectsJSON(t *testing.T) {
 	root := t.TempDir()
 	socket := filepath.Join(root, "s")
-	statusController(t, socket, `{"VM":"running","BackendReady":true,"SSH":"zero","Display":true,"DisplayMode":"remoteapp","Windows":-1,"Locked":false,"Queued":2,"Operation":"query-vm","LastError":"source error","Memory":{"GuestKnown":true,"Guest":{"total_bytes":8589934592,"available_bytes":2147483648},"LastError":"memory error","Growing":true}}`)
-	for _, asJSON := range []bool{false, true} {
-		var out, stderr bytes.Buffer
-		args := []string{"--socket", socket, "status"}
-		if asJSON {
-			args = append(args, "--json")
+	statusController(t, socket, `{"VM":"running","BackendReady":true,"SSH":"zero","Display":true,"DisplayMode":"remoteapp","Windows":-1,"Locked":false,"Queued":2,"Operation":"query-vm","LastError":"source error","Stage":"dispatch","BlockingReason":"session snapshot stale","RetainedLogins":2,"LogoffDeadline":"2026-10-22T12:00:00Z","Binding":{"reference":{"session_id":4,"authentication_id":"AUTH","boot_identifier":"BOOT"},"sid":"S-1","user":"user","domain":"DOMAIN"},"Sessions":{"Revision":3,"Fresh":true,"Sessions":[{"reference":{"session_id":4,"authentication_id":"AUTH","boot_identifier":"BOOT"},"sid":"S-1","user":"user"}]},"Memory":{"GuestKnown":true,"Guest":{"total_bytes":8589934592,"available_bytes":2147483648},"LastError":"memory error","Growing":true}}`)
+	var out, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"--socket", socket, "status"}, &out, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{versionString(), "虚拟机：running", "窗口：未知", "显示：已连接（remoteapp）", "8.00 GiB", "2.00 GiB", "source error", "memory error", "扩容", "绑定会话：4 DOMAIN\\user", "会话快照：新鲜", "保留登录：2", "阶段：dispatch", "阻塞原因：session snapshot stale", "空闲注销时间："} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatal("missing status information", want, out.String())
 		}
-		if err := run(context.Background(), args, &out, &stderr); err != nil {
-			t.Fatal(err)
-		}
-		if asJSON {
-			var fields map[string]any
-			if err := json.Unmarshal(out.Bytes(), &fields); err != nil || fields["Version"] != versionString() || fields["VM"] != "running" {
-				t.Fatal(out.String(), err)
-			}
-		} else {
-			for _, want := range []string{versionString(), "虚拟机：running", "窗口：未知", "显示：已连接（remoteapp）", "8.00 GiB", "2.00 GiB", "source error", "memory error", "扩容"} {
-				if !strings.Contains(out.String(), want) {
-					t.Fatal("missing status information", want, out.String())
-				}
-			}
-			if json.Valid(out.Bytes()) {
-				t.Fatal("default status is JSON")
-			}
-		}
+	}
+	if json.Valid(out.Bytes()) {
+		t.Fatal("status is JSON")
+	}
+	out.Reset()
+	stderr.Reset()
+	if err := run(context.Background(), []string{"--socket", socket, "status", "--json"}, &out, &stderr); err == nil {
+		t.Fatal("status --json is still accepted")
 	}
 }
 
@@ -168,5 +164,24 @@ func TestServiceOverrideQuotesPathsWithoutExpandingThem(t *testing.T) {
 	}
 	if _, err := hostServiceOverride("bad\x00path", "config", "socket"); err == nil {
 		t.Fatal("NUL accepted")
+	}
+}
+
+func TestStatusRendersUnknownRetainedLoginsForStaleSnapshot(t *testing.T) {
+	root := t.TempDir()
+	socket := filepath.Join(root, "s")
+	statusController(t, socket, `{"VM":"running","BackendReady":true,"SSH":"zero","Display":true,"DisplayMode":"remoteapp","Windows":-1,"RetainedLogins":-1,"Sessions":{"Revision":4,"Fresh":false,"Sessions":[{"reference":{"session_id":4,"authentication_id":"AUTH","boot_identifier":"BOOT"},"sid":"S-1","user":"user"}]}}`)
+	var out, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"--socket", socket, "status"}, &out, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "保留登录：未知") {
+		t.Fatal("negative retained count was not rendered as unknown", out.String())
+	}
+	if strings.Contains(out.String(), "保留登录：-1") {
+		t.Fatal("negative retained count leaked into status", out.String())
+	}
+	if !strings.Contains(out.String(), "会话快照：过期") {
+		t.Fatal("stale snapshot was not shown as stale", out.String())
 	}
 }

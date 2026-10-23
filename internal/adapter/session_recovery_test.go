@@ -25,7 +25,7 @@ func TestBackendReconnectsWithoutAnotherVMLifecycleEvent(t *testing.T) {
 			close(secondAccepted)
 			<-releaseSecond
 		}
-		_ = json.NewEncoder(conn).Encode(map[string]any{"status": "ok", "ssh_active": false})
+		_ = json.NewEncoder(conn).Encode(map[string]any{"protocol": agentProtocol, "status": "ok", "ssh_active": false})
 		if n == 1 {
 			<-closeFirst
 			return

@@ -13,13 +13,13 @@ func TestRequestFailureDoesNotDisableIdleManagement(t *testing.T) {
 		for _, display := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/display=%t", failure, display), func(t *testing.T) {
 				m := testMachine()
-				need := BackendOnly
+				mode := ""
 				if display {
 					displayReady(t, m)
 					m.windows(0)
-					need = Interactive
+					mode = ModeRemoteApp
 				}
-				j := addJob(m, "failing", need)
+				j := addJob(m, "failing", mode)
 				op := expectOp(t, m, epoch, Dispatch)
 				m.done(op.ID, Outcome{Err: failure}, epoch)
 				if len(m.completed) != 1 || m.completed[0].job != j || !errors.Is(m.completed[0].result.Err, failure) {
@@ -40,7 +40,7 @@ func TestRequestFailureDoesNotDisableIdleManagement(t *testing.T) {
 
 func TestQueuedCancellationStillStartsIdleDeadline(t *testing.T) {
 	m := testMachine()
-	j := addJob(m, "not-started", BackendOnly)
+	j := addJob(m, "not-started", "")
 	ctx, cancel := context.WithCancel(context.Background())
 	j.ctx = ctx
 	cancel()
@@ -67,7 +67,7 @@ func TestRequestedStopFailureGetsExactlyOneAutonomousRetry(t *testing.T) {
 	m := testMachine()
 	displayReady(t, m)
 	m.cleanupDisplay = true
-	j := addJob(m, "ping", BackendOnly)
+	j := backgroundJob(m, "ping")
 	stop := expectOp(t, m, epoch, StopDisplay)
 	if stop.job != j {
 		t.Fatal("first stop was not request-associated")
@@ -89,8 +89,8 @@ func TestRequestedStopFailureGetsExactlyOneAutonomousRetry(t *testing.T) {
 
 func TestFinishRejectsAnotherJobsCompletion(t *testing.T) {
 	m := testMachine()
-	first := addJob(m, "first", BackendOnly)
-	second := addJob(m, "second", BackendOnly)
+	first := backgroundJob(m, "first")
+	second := backgroundJob(m, "second")
 	defer func() {
 		if recover() == nil {
 			t.Fatal("completion for non-head did not reject invariant violation")

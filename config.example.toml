@@ -4,17 +4,14 @@ host = "192.0.2.10" # Explicit guest IP; no address discovery.
 user = "Administrator"
 service = "rdp-bridge" # Keyring service for the RDP password (username = user).
 agent_service = "rdp-bridge-agent" # Separate keyring service; username is always "agent".
-# Windows-side path of the shared token file. Passed to the interactive daemon
-# started by FreeRDP; only the path enters argv, never the token. The background
-# service must be given the same --auth-token-file separately. The file ACL must
+# Windows-side path of the shared token file. The Windows background service
+# (Session 0) must be given this file via --auth-token-file. The file ACL must
 # allow SYSTEM and the configured interactive Windows user; Administrators may
 # also be present as a trusted machine-admin exception. Use
 # windows-agent/install.ps1 to provision and verify it. Spaces/tabs inside the
-# token are preserved; only CR/LF are rejected. This is distinct from the file
-# path: RemoteApp token paths must not contain whitespace, commas, or quotes.
+# token are preserved; only CR/LF are rejected.
 agent_token_file = 'C:\ProgramData\rdp-launcher\agent-token'
-agent_port = 49152
-backend_port = 49153
+backend_port = 49153 # Single entry for host requests (Windows background service).
 
 [libvirt]
 socket = "/run/libvirt/libvirt-sock"
@@ -23,6 +20,7 @@ uri = "qemu:///system"
 [freerdp]
 bin = "sdl-freerdp"
 app_id = "com.freerdp.client.sdl3" # Niri observation; set to your client’s actual app_id.
+client_hostname = "rdp-launcher"   # Client NetBIOS/hostname sent to Windows (<=15 ASCII). Stable across runs.
 video_driver = "wayland"
 scale_desktop = 200
 clipboard = true
@@ -34,21 +32,19 @@ extra_args = []
 [freerdp.env]
 # SDL_RENDER_DRIVER = "opengl"
 
-[ui]
-dialog_bin = "rdp-launcher-dialog" # 可填绝对路径；仅在需要用户确认时启动。
-
 [remoteapp]
 default_app = 'C:\RdpLauncher\bin\remoteapp-launcher.exe'
 
 [lifecycle]
 vm_name = "win11"
 idle_disconnect_timeout = 30 # Seconds; 0 disables.
-vm_suspend_timeout = 300 # Seconds; 0 disables.
+idle_logoff_timeout = -1     # Seconds since display disconnected; -1 disables (default), 0 immediate, <= vm_suspend_timeout when suspend enabled.
+vm_suspend_timeout = 300     # Seconds; 0 disables.
 virtio_mem_alias = "ua-virtiomem0"
 
-# Both agent ports use the shared token from agent_service / agent_token_file.
+# The Windows backend service uses the shared token from agent_service / agent_token_file.
 # Loopback-only Windows binds may omit the token file, but the host uses the
-# guest IP here, so RemoteApp requires the file and background service flag.
+# guest IP here, so the background service requires the auth token flag.
 
 # Omit this section to disable automatic memory control.
 [memory]

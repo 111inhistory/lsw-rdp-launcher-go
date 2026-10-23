@@ -8,7 +8,7 @@ import (
 
 func TestDuplicateVMStateDoesNotInvalidateRequest(t *testing.T) {
 	m := testMachine()
-	addJob(m, "run", BackendOnly)
+	backgroundJob(m, "run")
 	op := expectOp(t, m, epoch, Dispatch)
 	m.vm(VMRunning)
 	m.done(op.ID, Outcome{Data: "ok"}, epoch)
@@ -19,7 +19,7 @@ func TestDuplicateVMStateDoesNotInvalidateRequest(t *testing.T) {
 
 func TestEarlyDisplayExitCannotBecomeReady(t *testing.T) {
 	m := testMachine()
-	addJob(m, "run", Interactive)
+	addJob(m, "run", ModeRemoteApp)
 	op := expectOp(t, m, epoch, StartDisplay)
 	m.displayExited(op.ID, nil)
 	m.done(op.ID, Outcome{}, epoch)
@@ -27,6 +27,7 @@ func TestEarlyDisplayExitCannotBecomeReady(t *testing.T) {
 		t.Fatal(m.snapshot(), m.completed)
 	}
 }
+
 func TestOldCompletionDoesNotCancelCurrentExecutor(t *testing.T) {
 	h := newHarness(t)
 	h.notify(t, BackendObserved{true, SSHZero})
@@ -47,6 +48,7 @@ func TestOldCompletionDoesNotCancelCurrentExecutor(t *testing.T) {
 		t.Fatal(r)
 	}
 }
+
 func TestLifecycleQueuedBeforeStartupIsAppliedFirst(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -85,15 +87,15 @@ func TestLifecycleQueuedBeforeStartupIsAppliedFirst(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 }
+
 func TestRealDeadlineDisconnectsThenPausesWithoutPolling(t *testing.T) {
-	h := newHarness(t, Options{IdleDisconnect: 10 * time.Millisecond, VMSuspend: 10 * time.Millisecond})
-	if err := h.c.SetLocked(h.ctx, true); err != nil {
-		t.Fatal(err)
-	}
+	h := newHarness(t, Options{IdleDisconnect: 10 * time.Millisecond, VMSuspend: 10 * time.Millisecond, IdleLogoff: -time.Second})
 	h.notify(t, BackendObserved{true, SSHZero})
-	result := h.request(h.ctx, Request{Action: "run", Need: Interactive})
+	result := h.request(h.ctx, Request{Action: "run", Mode: ModeRemoteApp})
 	h.expect(t, StartDisplay)
-	h.complete(t, Outcome{})
+	login := bindingLogin(2)
+	snapshot := sessionSnapshot(login)
+	h.complete(t, Outcome{Binding: &login, Sessions: &snapshot})
 	h.expect(t, Dispatch)
 	h.complete(t, Outcome{})
 	if r := h.reply(t, result); r.Err != nil {
@@ -102,30 +104,42 @@ func TestRealDeadlineDisconnectsThenPausesWithoutPolling(t *testing.T) {
 	h.notify(t, WindowsObserved{0})
 	h.expect(t, StopDisplay)
 	h.complete(t, Outcome{})
-	if err := h.c.SetLocked(h.ctx, false); err != nil {
-		t.Fatal(err)
-	}
 	h.expect(t, SuspendVM)
 	h.complete(t, Outcome{})
 	h.notify(t, VMObserved{VMPaused})
 	h.wait(t, func(s Snapshot) bool { return s.VM == VMPaused })
 }
+
 func TestRequestDuringSuspendWakesAgain(t *testing.T) {
 	m := testMachine()
 	expectIdle(t, m, epoch)
 	suspend := expectOp(t, m, epoch.Add(5*time.Minute), SuspendVM)
-	addJob(m, "run", Interactive)
+	addJob(m, "run", ModeRemoteApp)
 	m.done(suspend.ID, Outcome{}, epoch)
 	m.vm(VMPaused)
 	expectOp(t, m, epoch.Add(5*time.Minute), WakeVM)
 }
-func TestDisplayStartedAcrossVMChangeIsCleanedUp(t *testing.T) {
+
+func TestDisplayStartedAcrossVMChangeIsCleanedUpWithoutRevivingSessions(t *testing.T) {
 	m := testMachine()
-	addJob(m, "run", Interactive)
+	addJob(m, "run", ModeRemoteApp)
 	op := expectOp(t, m, epoch, StartDisplay)
+	generation := m.sessionGeneration
 	m.vm(VMOff)
-	m.done(op.ID, Outcome{}, epoch)
+	completeStart(t, m, op, bindingLogin(2))
+	if m.sessionGeneration == generation || m.state.Sessions.Fresh {
+		t.Fatal("old start observation revived sessions after VM loss", m.snapshot())
+	}
+	if !m.state.Display || m.state.Binding != nil {
+		t.Fatal("successful process start was not queued for cleanup", m.snapshot())
+	}
+	if len(m.queue) != 0 || len(m.completed) != 1 || m.completed[0].result.Err == nil || m.completed[0].result.Data != nil {
+		t.Fatal("old observation did not fail its caller", m.snapshot(), m.completed)
+	}
 	op = expectOp(t, m, epoch, StopDisplay)
 	m.done(op.ID, Outcome{}, epoch)
-	expectOp(t, m, epoch, WakeVM)
+	expectIdle(t, m, epoch)
+	if m.state.Display || m.state.Sessions.Fresh {
+		t.Fatal(m.snapshot())
+	}
 }

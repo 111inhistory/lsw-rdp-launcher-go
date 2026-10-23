@@ -19,8 +19,8 @@ func TestQueryFailureCompletesQueuedCallersRegardlessOfSourceMessageOrder(t *tes
 			m := testMachine()
 			m.vmSource(false)
 			m.vmSource(true)
-			a := addJob(m, "A", BackendOnly)
-			b := addJob(m, "B", BackendOnly)
+			a := backgroundJob(m, "A")
+			b := backgroundJob(m, "B")
 			query := expectOp(t, m, epoch, QueryVM)
 			for _, step := range tc.steps {
 				switch step {

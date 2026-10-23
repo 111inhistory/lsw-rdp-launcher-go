@@ -153,7 +153,7 @@ func TestLiveBackgroundOnlySession(t *testing.T) {
 		case <-ticker.C:
 		}
 	}
-	result := session.Controller.Do(ctx, controller.Request{Action: "status", Need: controller.BackendOnly})
+	result := session.Controller.Do(ctx, controller.Request{Action: "status"})
 	if result.Err != nil {
 		t.Fatal(result.Err)
 	}

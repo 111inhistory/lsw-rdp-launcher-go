@@ -16,7 +16,7 @@ type harness struct {
 
 func newHarness(t *testing.T, opts ...Options) *harness {
 	t.Helper()
-	var options Options
+	options := Options{IdleLogoff: -time.Second}
 	if len(opts) != 0 {
 		options = opts[0]
 	}
@@ -111,12 +111,12 @@ func (h *harness) reply(t *testing.T, ch <-chan Result) Result {
 func TestLoopRemainsResponsiveDuringExternalOperation(t *testing.T) {
 	h := newHarness(t)
 	h.notify(t, BackendObserved{true, SSHZero})
-	first := h.request(h.ctx, Request{Action: "first", Need: BackendOnly})
+	first := h.request(h.ctx, Request{Action: "first"})
 	op := h.expect(t, Dispatch)
 	if op.Request.Action != "first" {
 		t.Fatal(op)
 	}
-	second := h.request(h.ctx, Request{Action: "second", Need: BackendOnly})
+	second := h.request(h.ctx, Request{Action: "second"})
 	h.wait(t, func(s Snapshot) bool { return s.Queued == 2 })
 	if err := h.c.SetLocked(h.ctx, true); err != nil {
 		t.Fatal(err)
@@ -139,7 +139,7 @@ func TestLoopRemainsResponsiveDuringExternalOperation(t *testing.T) {
 func TestLoopProcessesLifecycleWhileDispatchIsPending(t *testing.T) {
 	h := newHarness(t)
 	h.notify(t, BackendObserved{true, SSHZero})
-	result := h.request(h.ctx, Request{Action: "slow", Need: BackendOnly})
+	result := h.request(h.ctx, Request{Action: "slow"})
 	h.expect(t, Dispatch)
 	h.notify(t, VMObserved{State: VMOff})
 	h.wait(t, func(s Snapshot) bool { return s.VM == VMOff })
@@ -151,7 +151,7 @@ func TestLoopProcessesLifecycleWhileDispatchIsPending(t *testing.T) {
 func TestCancelWakesQueueWaitingForBackend(t *testing.T) {
 	h := newHarness(t)
 	ctx, cancel := context.WithCancel(h.ctx)
-	result := h.request(ctx, Request{Action: "waiting", Need: BackendOnly})
+	result := h.request(ctx, Request{Action: "waiting"})
 	h.wait(t, func(s Snapshot) bool { return s.Queued == 1 })
 	cancel()
 	if r := h.reply(t, result); !errors.Is(r.Err, context.Canceled) {
@@ -163,7 +163,7 @@ func TestCancelReachesExecutor(t *testing.T) {
 	h := newHarness(t)
 	h.notify(t, BackendObserved{true, SSHZero})
 	ctx, cancel := context.WithCancel(h.ctx)
-	result := h.request(ctx, Request{Action: "pending", Need: BackendOnly})
+	result := h.request(ctx, Request{Action: "pending"})
 	h.expect(t, Dispatch)
 	cancel()
 	if r := h.reply(t, result); !errors.Is(r.Err, context.Canceled) {
@@ -171,18 +171,20 @@ func TestCancelReachesExecutor(t *testing.T) {
 	}
 	h.wait(t, func(s Snapshot) bool { return s.Queued == 0 && s.Operation == "" })
 }
-func TestLoopInteractiveWaitsForBackendAfterDisplay(t *testing.T) {
+func TestLoopUserRequestWaitsForBackendThenBindsBeforeDispatch(t *testing.T) {
 	h := newHarness(t)
-	result := h.request(h.ctx, Request{Action: "run", Need: Interactive})
-	h.expect(t, StartDisplay)
-	h.complete(t, Outcome{})
-	h.wait(t, func(s Snapshot) bool { return s.Display && s.Operation == "" })
+	result := h.request(h.ctx, Request{Action: "run", Mode: ModeRemoteApp})
+	h.wait(t, func(s Snapshot) bool { return s.Queued == 1 })
 	select {
 	case op := <-h.operations:
-		t.Fatalf("dispatched before backend ready: %+v", op)
+		t.Fatalf("started display before backend readiness: %+v", op)
 	default:
 	}
 	h.notify(t, BackendObserved{true, SSHUnknown})
+	h.expect(t, StartDisplay)
+	login := bindingLogin(2)
+	snapshot := sessionSnapshot(login)
+	h.complete(t, Outcome{Binding: &login, Sessions: &snapshot})
 	h.expect(t, Dispatch)
 	h.complete(t, Outcome{Data: "started"})
 	if r := h.reply(t, result); r.Err != nil || r.Data != "started" {

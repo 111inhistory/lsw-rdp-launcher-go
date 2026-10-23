@@ -12,7 +12,7 @@ func TestSourceLossReleasesAcceptedVMCommandWithoutReplayingIt(t *testing.T) {
 			now := epoch
 			if kind == WakeVM {
 				m.vm(VMPaused)
-				addJob(m, "original", BackendOnly)
+				backgroundJob(m, "original")
 			} else {
 				expectIdle(t, m, now)
 				now = now.Add(m.opts.VMSuspend)
@@ -22,7 +22,7 @@ func TestSourceLossReleasesAcceptedVMCommandWithoutReplayingIt(t *testing.T) {
 			if m.busy == nil || !m.busy.accepted {
 				t.Fatal("command did not wait for confirmation")
 			}
-			tail := addJob(m, "later", BackendOnly)
+			tail := backgroundJob(m, "later")
 			m.vmSource(false)
 			if m.busy != nil || m.state.VM != VMUnknown {
 				t.Fatal("lost confirmation still owns control slot", m.snapshot())
@@ -52,7 +52,7 @@ func TestSourceLossReleasesAcceptedVMCommandWithoutReplayingIt(t *testing.T) {
 func TestLateVMCommandAckAfterReconnectDoesNotWaitForLostConfirmation(t *testing.T) {
 	m := testMachine()
 	m.vm(VMPaused)
-	addJob(m, "original", BackendOnly)
+	backgroundJob(m, "original")
 	op := expectOp(t, m, epoch, WakeVM)
 	m.vmSource(false)
 	m.vmSource(true)

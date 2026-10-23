@@ -1,7 +1,8 @@
 // niri >= 26.04. Only the RDP Launcher confirmation dialog is affected.
+// The dialog is embedded directly in the rdp-launcher CLI binary.
 // The application draws an alpha background, not globally faded text/buttons.
 window-rule {
-    match app-id="^rdp-launcher-dialog$"
+    match app-id="^rdp-launcher$"
     open-floating true
     // Inherit the desktop/DMS corner radius instead of overriding it.
     clip-to-geometry true

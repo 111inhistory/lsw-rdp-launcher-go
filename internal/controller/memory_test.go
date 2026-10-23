@@ -12,7 +12,7 @@ const GiB = 1024 * MiB
 
 func memoryMachine(t *testing.T) *machine {
 	t.Helper()
-	m := newMachine(Options{Memory: &MemoryPolicy{}, VMSuspend: 300 * time.Second})
+	m := newMachine(Options{Memory: &MemoryPolicy{}, VMSuspend: 300 * time.Second, IdleLogoff: -time.Second})
 	m.vm(VMRunning)
 	m.needQuery = false
 	m.backend(true, SSHZero)

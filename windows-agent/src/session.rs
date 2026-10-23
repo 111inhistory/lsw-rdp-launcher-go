@@ -1,65 +1,404 @@
-//! Session-scoped observation and explicit logoff. SSH/service session 0 is
-//! never selected. A short-lived copy of this binary observes UI in the user's
-//! desktop; the SYSTEM backend itself never creates a GUI window.
-use serde::{Deserialize, Serialize};
-use std::{
-    fs, io, mem,
-    path::{Path, PathBuf},
-    ptr, slice,
-};
-use windows_sys::Win32::{
-    Foundation::*,
-    Security::{Authorization::*, *},
-    Storage::FileSystem::CreateDirectoryW,
-    System::{RemoteDesktop::*, Threading::*},
-};
+//! WTS session snapshot, logon-instance identity and SYSTEM logoff command.
+//!
+//! Session 0 is never a user target. A session number alone is not an
+//! identity: every executable reference also carries the logon
+//! AuthenticationId and the current boot identifier. The configured account is
+//! matched by SID, never by a possibly duplicated display name.
+use std::io;
+use std::mem;
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::ptr;
+use std::slice;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Activity {
-    pub session_id: u32,
+use windows_sys::core::GUID;
+use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
+use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
+use windows_sys::Win32::Security::*;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::RemoteDesktop::*;
+use windows_sys::Win32::System::Threading::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+use crate::protocol::{
+    apply_observation, format_authentication_id, format_client_address, format_guid, invalidate,
+    same_boot_identifier, verify_worker_identity, Observation, SessionEntry, SessionRef, Snapshot,
+    WorkerExpectedIdentity, WorkerSessionStatus,
+};
+use crate::worker;
+
+/// Overall budget for one logoff request, including command wait and the final
+/// disappearance confirmation. The command never receives a second budget.
+pub const LOGOFF_TIMEOUT: Duration = Duration::from_secs(30);
+/// The snapshot refresh query must be bounded even when a WTS call hangs.
+pub const SNAPSHOT_QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+/// A caller waits slightly longer than the refresh worker's own timeout so it
+/// normally observes a published fresh/stale result instead of racing it.
+pub const SNAPSHOT_WAIT_TIMEOUT: Duration = Duration::from_secs(22);
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
+/// UI activity is optional display data, so it must not delay the snapshot
+/// indefinitely. At most this many sessions are sampled per refresh.
+const UI_PROBE_BUDGET: Duration = Duration::from_secs(4);
+const UI_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_UI_SESSIONS: usize = 4;
+
+const SYSTEM_BOOT_ENVIRONMENT_INFORMATION_CLASS: i32 = 90;
+
+pub struct Access {
     pub user: String,
-    pub fingerprint: String,
-    pub windows: Option<u32>,
-    pub tray_icons: Option<u32>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub note: String,
+    pub host: IpAddr,
+    pub sid: String,
 }
-#[derive(Serialize, Deserialize)]
-pub struct Ui {
-    pub windows: Option<u32>,
-    pub tray_icons: Option<u32>,
+
+impl Access {
+    pub fn new(user: String, host: IpAddr) -> io::Result<Self> {
+        let sid = resolve_sid(&user)?;
+        Ok(Self { user, host, sid })
+    }
+
+    pub fn allows_host(&self, peer: IpAddr) -> bool {
+        self.host == peer
+    }
+
+    pub fn allows(&self, peer: IpAddr, user: &str) -> bool {
+        self.allows_host(peer) && self.user.eq_ignore_ascii_case(user)
+    }
+
+    /// `inspect_sessions` may omit the user because the backend is already
+    /// bound to one configured account; when present it must still match.
+    pub fn allows_optional_user(&self, peer: IpAddr, user: Option<&str>) -> bool {
+        self.allows_host(peer)
+            && user
+                .map(|user| self.user.eq_ignore_ascii_case(user))
+                .unwrap_or(true)
+    }
 }
-struct Session {
-    id: u32,
+
+struct Handle(HANDLE);
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.0.is_null() {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+fn text(buffer: &[u16]) -> String {
+    let length = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..length])
+}
+
+unsafe fn sid_to_string(sid: PSID) -> io::Result<String> {
+    let mut raw = ptr::null_mut();
+    if ConvertSidToStringSidW(sid, &mut raw) == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut length = 0;
+    while *raw.add(length) != 0 {
+        length += 1;
+    }
+    let value = String::from_utf16_lossy(slice::from_raw_parts(raw, length));
+    LocalFree(raw.cast());
+    Ok(value)
+}
+
+pub fn resolve_sid(account: &str) -> io::Result<String> {
+    let account = wide(account);
+    let mut sid_size = 0u32;
+    let mut domain_size = 0u32;
+    let mut kind = 0i32;
+    unsafe {
+        LookupAccountNameW(
+            ptr::null(),
+            account.as_ptr(),
+            ptr::null_mut(),
+            &mut sid_size,
+            ptr::null_mut(),
+            &mut domain_size,
+            &mut kind,
+        );
+    }
+    if sid_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "cannot resolve configured session account {} to a SID",
+                String::from_utf16_lossy(&account[..account.len().saturating_sub(1)])
+            ),
+        ));
+    }
+    let mut sid = vec![0u8; sid_size as usize];
+    let mut domain = vec![0u16; domain_size as usize];
+    unsafe {
+        if LookupAccountNameW(
+            ptr::null(),
+            account.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_size,
+            domain.as_mut_ptr(),
+            &mut domain_size,
+            &mut kind,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        sid_to_string(sid.as_mut_ptr().cast())
+    }
+}
+
+struct TokenIdentity {
+    sid: String,
+    authentication_id: Option<String>,
+}
+
+fn token_identity(session_id: u32) -> io::Result<TokenIdentity> {
+    unsafe {
+        let mut raw_token = ptr::null_mut();
+        if WTSQueryUserToken(session_id, &mut raw_token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = Handle(raw_token);
+
+        let mut needed = 0u32;
+        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut user = vec![0u8; needed as usize];
+        if GetTokenInformation(
+            token.0,
+            TokenUser,
+            user.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let sid = sid_to_string(
+            ptr::read_unaligned(user.as_ptr() as *const TOKEN_USER)
+                .User
+                .Sid,
+        )?;
+
+        let mut statistics: TOKEN_STATISTICS = mem::zeroed();
+        let mut length = 0u32;
+        let authentication_id = (GetTokenInformation(
+            token.0,
+            TokenStatistics,
+            (&mut statistics as *mut TOKEN_STATISTICS).cast(),
+            mem::size_of::<TOKEN_STATISTICS>() as u32,
+            &mut length,
+        ) != 0)
+            .then(|| {
+                format_authentication_id(
+                    statistics.AuthenticationId.HighPart,
+                    statistics.AuthenticationId.LowPart,
+                )
+            });
+        Ok(TokenIdentity {
+            sid,
+            authentication_id,
+        })
+    }
+}
+
+#[repr(C)]
+struct BootEnvironmentInformation {
+    boot_identifier: GUID,
+    firmware_type: u32,
+    boot_flags: u64,
+}
+
+fn account_name_from_sid(sid_string: &str) -> io::Result<String> {
+    let sid_text = wide(sid_string);
+    let mut sid = ptr::null_mut();
+    unsafe {
+        if ConvertStringSidToSidW(sid_text.as_ptr(), &mut sid) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut name = [0u16; 256];
+        let mut name_length = name.len() as u32;
+        let mut domain = [0u16; 256];
+        let mut domain_length = domain.len() as u32;
+        let mut kind = 0i32;
+        let ok = LookupAccountSidW(
+            ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut name_length,
+            domain.as_mut_ptr(),
+            &mut domain_length,
+            &mut kind,
+        );
+        let error = io::Error::last_os_error();
+        LocalFree(sid.cast());
+        if ok == 0 {
+            return Err(error);
+        }
+        let domain = text(&domain[..domain_length as usize]);
+        let name = text(&name[..name_length as usize]);
+        Ok(if domain.is_empty() {
+            name
+        } else {
+            format!(r"{domain}\{name}")
+        })
+    }
+}
+
+fn current_process_identity() -> io::Result<(String, String)> {
+    unsafe {
+        let mut token = ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = Handle(token);
+
+        let mut needed = 0u32;
+        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut user = vec![0u8; needed as usize];
+        if GetTokenInformation(
+            token.0,
+            TokenUser,
+            user.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let sid = sid_to_string(
+            ptr::read_unaligned(user.as_ptr() as *const TOKEN_USER)
+                .User
+                .Sid,
+        )?;
+
+        let mut statistics: TOKEN_STATISTICS = mem::zeroed();
+        let mut length = 0u32;
+        if GetTokenInformation(
+            token.0,
+            TokenStatistics,
+            (&mut statistics as *mut TOKEN_STATISTICS).cast(),
+            mem::size_of::<TOKEN_STATISTICS>() as u32,
+            &mut length,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let authentication_id = format_authentication_id(
+            statistics.AuthenticationId.HighPart,
+            statistics.AuthenticationId.LowPart,
+        );
+        Ok((sid, authentication_id))
+    }
+}
+
+fn current_session_id() -> io::Result<u32> {
+    let mut session_id = 0u32;
+    if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(session_id)
+}
+
+/// Read the worker's own complete logon identity. This is the authority the
+/// worker checks before any business action, independently of the request.
+pub fn current_worker_identity() -> io::Result<(SessionRef, String)> {
+    let session_id = current_session_id()?;
+    let (sid, authentication_id) = current_process_identity()?;
+    let reference = SessionRef {
+        session_id,
+        authentication_id,
+        boot_identifier: boot_identifier()?,
+    };
+    reference.validate().map_err(io::Error::other)?;
+    Ok((reference, sid))
+}
+
+pub fn verify_worker_expected(expected: &WorkerExpectedIdentity) -> io::Result<()> {
+    let (actual, actual_sid) = current_worker_identity()?;
+    verify_worker_identity(&expected.reference, &expected.sid, &actual, &actual_sid)
+        .map_err(io::Error::other)
+}
+
+/// Report the worker's actual execution session and reference. The backend
+/// compares this actual value with the reference it verified before spawning.
+pub fn worker_status() -> io::Result<WorkerSessionStatus> {
+    let (reference, sid) = current_worker_identity()?;
+    let session = raw_session(reference.session_id)?;
+    if session.user.is_empty() {
+        return Err(io::Error::other(
+            "user worker has no logged-on session identity",
+        ));
+    }
+    let user = account_name_from_sid(&sid).unwrap_or_else(|_| session.user.clone());
+    let ui = crate::session_ui::observe();
+    Ok(WorkerSessionStatus {
+        reference: reference.clone(),
+        session_id: reference.session_id,
+        session_active: session.state == WTSActive,
+        sid,
+        user,
+        windows: ui.windows,
+        tray_icons: ui.tray_icons,
+        note: None,
+    })
+}
+
+pub fn boot_identifier() -> io::Result<String> {
+    let mut information: BootEnvironmentInformation = unsafe { mem::zeroed() };
+    let mut returned = 0u32;
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_BOOT_ENVIRONMENT_INFORMATION_CLASS,
+            (&mut information as *mut BootEnvironmentInformation).cast(),
+            mem::size_of::<BootEnvironmentInformation>() as u32,
+            &mut returned,
+        )
+    };
+    if status < 0 {
+        return Err(io::Error::other(format!(
+            "SystemBootEnvironmentInformation failed with NTSTATUS {status:#x}"
+        )));
+    }
+    if returned < mem::size_of::<GUID>() as u32 {
+        return Err(io::Error::other(
+            "SystemBootEnvironmentInformation returned a short identifier",
+        ));
+    }
+    let guid = information.boot_identifier;
+    Ok(format_guid(guid.data1, guid.data2, guid.data3, guid.data4))
+}
+
+struct RawSession {
     user: String,
     domain: String,
     logon: i64,
-    state: WTS_CONNECTSTATE_CLASS,
+    connect: i64,
+    state: i32,
 }
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
-fn text(s: &[u16]) -> String {
-    String::from_utf16_lossy(&s[..s.iter().position(|v| *v == 0).unwrap_or(s.len())])
-}
-impl Session {
-    fn owner(&self) -> String {
-        format!("{}\\{}", self.domain, self.user)
-    }
-    fn fingerprint(&self) -> String {
-        if self.logon <= 0 {
-            return String::new();
-        }
-        format!("{}:{}:{}", self.id, self.logon, self.owner())
-    }
-    fn matches(&self, user: &str) -> bool {
-        self.user.eq_ignore_ascii_case(user) || self.owner().eq_ignore_ascii_case(user)
-    }
-}
-fn session(id: u32) -> io::Result<Session> {
+
+fn raw_session(id: u32) -> io::Result<RawSession> {
     unsafe {
         let mut buffer = ptr::null_mut();
-        let mut size = 0;
+        let mut size = 0u32;
         if WTSQuerySessionInformationW(
             ptr::null_mut(),
             id,
@@ -70,314 +409,727 @@ fn session(id: u32) -> io::Result<Session> {
         {
             return Err(io::Error::last_os_error());
         }
-        if size < (mem::size_of::<WTSINFOEXW>() as u32) {
+        if size < mem::size_of::<WTSINFOEXW>() as u32 {
             WTSFreeMemory(buffer.cast());
             return Err(io::Error::other("short WTS session info"));
         }
-        let info = *(buffer as *const WTSINFOEXW);
+        let information = *(buffer as *const WTSINFOEXW);
         WTSFreeMemory(buffer.cast());
-        if info.Level != 1 {
+        if information.Level != 1 {
             return Err(io::Error::other("unsupported WTS session info level"));
         }
-        let info = info.Data.WTSInfoExLevel1;
-        Ok(Session {
-            id,
-            user: text(&info.UserName),
-            domain: text(&info.DomainName),
-            logon: info.LogonTime,
-            state: info.SessionState,
+        let information = information.Data.WTSInfoExLevel1;
+        Ok(RawSession {
+            user: text(&information.UserName),
+            domain: text(&information.DomainName),
+            logon: information.LogonTime,
+            connect: information.ConnectTime,
+            state: information.SessionState,
         })
     }
 }
-fn sessions(user: &str) -> io::Result<Vec<Session>> {
+
+fn session_ids() -> io::Result<Vec<u32>> {
     unsafe {
         let mut data = ptr::null_mut();
-        let mut count = 0;
+        let mut count = 0u32;
         if WTSEnumerateSessionsW(ptr::null_mut(), 0, 1, &mut data, &mut count) == 0 {
             return Err(io::Error::last_os_error());
         }
-        let ids: Vec<_> = slice::from_raw_parts(data, count as usize)
+        let ids = slice::from_raw_parts(data, count as usize)
             .iter()
-            .filter(|s| s.SessionId != 0)
-            .map(|s| s.SessionId)
+            .filter(|session| session.SessionId != 0)
+            .map(|session| session.SessionId)
             .collect();
         WTSFreeMemory(data.cast());
-        let mut found = Vec::new();
-        for id in ids {
-            let s = session(id)?;
-            if !s.user.is_empty() && s.matches(user) {
-                found.push(s)
-            }
-        }
-        Ok(found)
+        Ok(ids)
     }
 }
+
+fn session_present(id: u32) -> io::Result<bool> {
+    Ok(session_ids()?.contains(&id))
+}
+
+fn client_name(id: u32) -> io::Result<String> {
+    unsafe {
+        let mut buffer = ptr::null_mut();
+        let mut bytes = 0u32;
+        if WTSQuerySessionInformationW(ptr::null_mut(), id, WTSClientName, &mut buffer, &mut bytes)
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let units = (bytes as usize / mem::size_of::<u16>()).max(1);
+        let value = text(slice::from_raw_parts(buffer, units));
+        WTSFreeMemory(buffer.cast());
+        Ok(value)
+    }
+}
+
+fn client_address(id: u32) -> io::Result<String> {
+    unsafe {
+        let mut buffer = ptr::null_mut();
+        let mut bytes = 0u32;
+        if WTSQuerySessionInformationW(
+            ptr::null_mut(),
+            id,
+            WTSClientAddress,
+            &mut buffer,
+            &mut bytes,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if bytes < mem::size_of::<WTS_CLIENT_ADDRESS>() as u32 {
+            WTSFreeMemory(buffer.cast());
+            return Err(io::Error::other("short WTS client address"));
+        }
+        let address = *(buffer as *const WTS_CLIENT_ADDRESS);
+        WTSFreeMemory(buffer.cast());
+        Ok(format_client_address(
+            address.AddressFamily,
+            &address.Address,
+        ))
+    }
+}
+
+/// Build the full snapshot of logons for the configured account SID. A session
+/// whose identity cannot be read remains absent from the list (it cannot be
+/// attributed safely), and the snapshot is marked not fresh.
+pub fn observe(configured_sid: &str) -> io::Result<Observation> {
+    let boot = boot_identifier()?;
+    let ids = session_ids()?;
+    let mut complete = true;
+    let mut sessions = Vec::new();
+    let ui_budget = Instant::now() + UI_PROBE_BUDGET;
+    let mut ui_sampled = 0usize;
+
+    for id in ids {
+        let raw = match raw_session(id) {
+            Ok(raw) => raw,
+            Err(error) => {
+                complete = false;
+                log::warn!("WTS session {id} info unavailable: {error}");
+                continue;
+            }
+        };
+        if raw.user.is_empty() {
+            continue;
+        }
+        let identity = match token_identity(id) {
+            Ok(identity) => identity,
+            Err(error) => {
+                complete = false;
+                log::warn!("WTS session {id} token identity unavailable: {error}");
+                continue;
+            }
+        };
+        if identity.sid != configured_sid {
+            continue;
+        }
+
+        let authentication_id = identity.authentication_id.unwrap_or_default();
+        if authentication_id.is_empty() {
+            complete = false;
+        }
+        let client_name = client_name(id).unwrap_or_else(|error| {
+            log::debug!("WTS session {id} client name unavailable: {error}");
+            String::new()
+        });
+        let client_address = client_address(id).unwrap_or_else(|error| {
+            log::debug!("WTS session {id} client address unavailable: {error}");
+            String::new()
+        });
+
+        let mut note = if authentication_id.is_empty() || boot.is_empty() {
+            Some("session identity incomplete; dispatch and logoff disabled".to_string())
+        } else {
+            None
+        };
+        let mut windows = None;
+        let mut tray_icons = None;
+        if ui_sampled < MAX_UI_SESSIONS && Instant::now() < ui_budget {
+            let remaining = ui_budget.saturating_duration_since(Instant::now());
+            let timeout = remaining.min(UI_PROBE_TIMEOUT);
+            match worker::observe_ui(id, configured_sid, timeout) {
+                Ok(ui) => {
+                    windows = ui.windows;
+                    tray_icons = ui.tray_icons;
+                }
+                Err(error) => {
+                    log::debug!("WTS session {id} UI activity unavailable: {error}");
+                    note = Some(match note {
+                        Some(existing) => format!("{existing}; UI activity unavailable"),
+                        None => "UI activity unavailable".to_string(),
+                    });
+                }
+            }
+            ui_sampled += 1;
+        }
+
+        sessions.push(SessionEntry {
+            reference: SessionRef {
+                session_id: id,
+                authentication_id,
+                boot_identifier: boot.clone(),
+            },
+            sid: identity.sid,
+            user: raw.user,
+            domain: raw.domain,
+            state: raw.state,
+            client_name,
+            client_address,
+            logon_time: raw.logon,
+            connect_time: raw.connect,
+            windows,
+            tray_icons,
+            note,
+        });
+    }
+    sessions.sort_by_key(|session| session.reference.session_id);
+    Ok(Observation {
+        fresh: complete && !boot.is_empty(),
+        sessions,
+    })
+}
+
+/// Final pre-execution identity check. Errors mean the target must not be
+/// dispatched or logged off.
+pub fn verify_reference(reference: &SessionRef, configured_sid: &str) -> io::Result<()> {
+    reference.validate().map_err(io::Error::other)?;
+    let boot = boot_identifier()?;
+    if !same_boot_identifier(&reference.boot_identifier, &boot) {
+        return Err(io::Error::other(
+            "boot identifier changed; session reference is stale",
+        ));
+    }
+    if !session_present(reference.session_id)? {
+        return Err(io::Error::other("target session no longer exists"));
+    }
+    let raw = raw_session(reference.session_id)?;
+    if raw.user.is_empty() {
+        return Err(io::Error::other("target session has no logged-on user"));
+    }
+    let identity = token_identity(reference.session_id)?;
+    if identity.sid != configured_sid {
+        return Err(io::Error::other(
+            "target session account SID does not match the configured account",
+        ));
+    }
+    match identity.authentication_id {
+        Some(authentication_id) if authentication_id == reference.authentication_id => Ok(()),
+        Some(_) => Err(io::Error::other(
+            "target session logon identity changed; session reference is stale",
+        )),
+        None => Err(io::Error::other(
+            "target session logon identity is unavailable",
+        )),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PollState {
+    Gone,
+    Same,
+    Reused,
+    Unknown,
+}
+
+/// Pure classification of one post-command observation for tests and the
+/// polling loop.
+pub fn classify_poll(
+    present: bool,
+    sid: Option<&str>,
+    authentication_id: Option<&str>,
+    configured_sid: &str,
+    expected_authentication_id: &str,
+) -> PollState {
+    if !present {
+        return PollState::Gone;
+    }
+    match (sid, authentication_id) {
+        (Some(sid), Some(authentication_id)) if sid == configured_sid => {
+            if authentication_id == expected_authentication_id {
+                PollState::Same
+            } else {
+                PollState::Reused
+            }
+        }
+        (Some(sid), Some(_)) if sid != configured_sid => PollState::Reused,
+        _ => PollState::Unknown,
+    }
+}
+
+fn poll_state(
+    session_id: u32,
+    configured_sid: &str,
+    expected_authentication_id: &str,
+) -> PollState {
+    match session_present(session_id) {
+        Ok(false) => PollState::Gone,
+        Err(_) => PollState::Unknown,
+        Ok(true) => match token_identity(session_id) {
+            Ok(identity) => classify_poll(
+                true,
+                Some(&identity.sid),
+                identity.authentication_id.as_deref(),
+                configured_sid,
+                expected_authentication_id,
+            ),
+            Err(_) => PollState::Unknown,
+        },
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LogoffResult {
+    Confirmed(String),
+    NotStarted(String),
+    Failed(String),
+    Unknown(String),
+    Anomaly(String),
+}
+
+impl LogoffResult {
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            Self::Confirmed(_) => "confirmed",
+            Self::NotStarted(_) => "not_started",
+            Self::Failed(_) => "failed",
+            Self::Unknown(_) => "unknown",
+            Self::Anomaly(_) => "anomaly",
+        }
+    }
+
+    pub fn message(self) -> String {
+        match self {
+            Self::Confirmed(message)
+            | Self::NotStarted(message)
+            | Self::Failed(message)
+            | Self::Unknown(message)
+            | Self::Anomaly(message) => message,
+        }
+    }
+}
+
+fn system_logoff_path() -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    root.join("System32").join("logoff.exe")
+}
+
+/// Log off exactly one verified logon with the fixed system `logoff.exe`.
+///
+/// The command uses one numeric argument, runs in the Agent's existing SYSTEM /
+/// Session 0 context, and is never retried. Exit code 0 is not evidence by
+/// itself: the original SessionRef must disappear before the same operation
+/// deadline. A reused Session ID is reported as an anomaly and no further
+/// action is attempted.
+///
+/// The final identity query and post-command confirmation are native WTS calls
+/// that cannot be cancelled. If a confirmation query blocks past the deadline,
+/// this function can return late, but it still reports `Unknown` unless the
+/// original logon was actually observed gone. No command is started after the
+/// deadline has already expired.
+pub fn logoff(configured_sid: &str, reference: &SessionRef) -> LogoffResult {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    let deadline = Instant::now() + LOGOFF_TIMEOUT;
+    if let Err(error) = verify_reference(reference, configured_sid) {
+        return LogoffResult::NotStarted(format!(
+            "target session changed; logoff was not started: {error}"
+        ));
+    }
+    if Instant::now() >= deadline {
+        return LogoffResult::NotStarted(
+            "target verification did not finish before the logoff deadline; logoff was not started"
+                .to_string(),
+        );
+    }
+
+    let path = system_logoff_path();
+    let mut child = match Command::new(&path)
+        .arg(reference.session_id.to_string())
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW; no shell, no extra privileges
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return LogoffResult::Failed(format!("failed to start {}: {error}", path.display()))
+        }
+    };
+
+    let mut exit = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit = Some(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return LogoffResult::Failed(format!("failed to observe logoff.exe: {error}"))
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    loop {
+        match poll_state(
+            reference.session_id,
+            configured_sid,
+            &reference.authentication_id,
+        ) {
+            PollState::Gone => {
+                return LogoffResult::Confirmed(match exit {
+                    Some(status) if status.success() => "session logoff confirmed".to_string(),
+                    Some(status) => {
+                        format!("session logoff confirmed after logoff.exe exited with {status}")
+                    }
+                    None => "session logoff confirmed before logoff.exe exited".to_string(),
+                })
+            }
+            PollState::Reused => {
+                return LogoffResult::Anomaly(
+                    "session ID was reused by a different logon after logoff.exe was started; \
+                     no further action was attempted"
+                        .to_string(),
+                )
+            }
+            PollState::Same | PollState::Unknown => {}
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    match exit {
+        Some(status) if !status.success() => LogoffResult::Failed(format!(
+            "logoff.exe exited with {status}, but the original session reference was not \
+             confirmed gone before the deadline"
+        )),
+        Some(_) => LogoffResult::Unknown(
+            "logoff.exe exited successfully, but the original session reference was not \
+             confirmed gone before the deadline"
+                .to_string(),
+        ),
+        None => LogoffResult::Unknown(
+            "logoff.exe did not exit before the 30 second deadline; outcome is unknown".to_string(),
+        ),
+    }
+}
+
+// WTS session-change notifications only wake the snapshot refresher. The
+// callback never performs a full query.
+static SESSION_SIGNAL: std::sync::OnceLock<tokio::sync::mpsc::Sender<()>> =
+    std::sync::OnceLock::new();
+
+unsafe extern "system" fn watch_proc(
+    window: HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    if message == WM_WTSSESSION_CHANGE {
+        if let Some(signal) = SESSION_SIGNAL.get() {
+            let _ = signal.try_send(());
+        }
+        return 0;
+    }
+    DefWindowProcW(window, message, wparam, lparam)
+}
+
+/// Start a hidden, message-only WTS observer for all sessions. The callback
+/// only signals; snapshot queries run in the bounded refresher.
+pub fn start_watcher(signal: tokio::sync::mpsc::Sender<()>) -> io::Result<()> {
+    let _ = SESSION_SIGNAL.set(signal);
+    std::thread::Builder::new()
+        .name("session-watch".into())
+        .spawn(|| unsafe {
+            let class_name = wide("RdpLauncherSessionWatchClass");
+            let window_name = wide("Rdp Launcher Session Watch");
+            let class = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(watch_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: GetModuleHandleW(ptr::null()),
+                hIcon: ptr::null_mut(),
+                hCursor: ptr::null_mut(),
+                hbrBackground: ptr::null_mut(),
+                lpszMenuName: ptr::null(),
+                lpszClassName: class_name.as_ptr(),
+            };
+            RegisterClassW(&class);
+            let window = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                window_name.as_ptr(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                -3_isize as HWND, // HWND_MESSAGE
+                ptr::null_mut(),
+                class.hInstance,
+                ptr::null_mut(),
+            );
+            if window.is_null() {
+                log::warn!("failed to create session watcher window");
+                return;
+            }
+            if WTSRegisterSessionNotification(window, NOTIFY_FOR_ALL_SESSIONS) == 0 {
+                log::warn!(
+                    "WTSRegisterSessionNotification(all sessions) failed: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            let mut message: MSG = mem::zeroed();
+            while GetMessageW(&mut message, ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            WTSUnRegisterSessionNotification(window);
+        })?;
+    Ok(())
+}
+
+struct RefreshGate {
+    in_flight: AtomicBool,
+    next_attempt: AtomicU64,
+    latest_attempt: AtomicU64,
+}
+
+impl RefreshGate {
+    fn new() -> Self {
+        Self {
+            in_flight: AtomicBool::new(false),
+            next_attempt: AtomicU64::new(0),
+            latest_attempt: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Owns the last published snapshot and one serial refresh loop. All WTS
+/// notifications and inspect requests are coalesced into this loop.
+pub struct SnapshotHub {
+    state: tokio::sync::watch::Sender<Snapshot>,
+    refresh: tokio::sync::mpsc::Sender<()>,
+    completed: tokio::sync::watch::Receiver<u64>,
+}
+
+impl SnapshotHub {
+    pub fn start(configured_sid: String, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        let (state, _) = tokio::sync::watch::channel(Snapshot::default());
+        let (refresh, mut requests) = tokio::sync::mpsc::channel::<()>(1);
+        let (completed_tx, completed) = tokio::sync::watch::channel(0u64);
+        let gate = Arc::new(RefreshGate::new());
+        let state_task = state.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SNAPSHOT_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    request = requests.recv() => {
+                        if request.is_none() { break; }
+                    }
+                    _ = interval.tick() => {}
+                }
+                if *shutdown.borrow() {
+                    break;
+                }
+                // Coalesce a burst of notifications into one bounded query.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                while requests.try_recv().is_ok() {}
+
+                refresh_once(
+                    &configured_sid,
+                    &state_task,
+                    Arc::clone(&gate),
+                    SNAPSHOT_QUERY_TIMEOUT,
+                )
+                .await;
+                let completed_now = *completed_tx.borrow();
+                completed_tx.send_replace(completed_now.saturating_add(1));
+            }
+        });
+
+        Self {
+            state,
+            refresh,
+            completed,
+        }
+    }
+
+    pub fn current(&self) -> Snapshot {
+        self.state.borrow().clone()
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Snapshot> {
+        self.state.subscribe()
+    }
+
+    /// Wake the refresher after a WTS session-change notification.
+    pub fn signal(&self) -> tokio::sync::mpsc::Sender<()> {
+        self.refresh.clone()
+    }
+
+    /// Request a refresh and wait up to `timeout` for one completed query. On a
+    /// caller timeout the old snapshot is invalidated for display but is never
+    /// used as a fresh dispatch target.
+    pub async fn inspect(&self, timeout: Duration) -> Snapshot {
+        let before = *self.completed.borrow();
+        let _ = self.refresh.try_send(());
+        let deadline = Instant::now() + timeout;
+        let mut completed = self.completed.clone();
+        loop {
+            if *completed.borrow() > before {
+                return self.current();
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, completed.changed()).await {
+                Ok(Ok(())) => {}
+                _ => break,
+            }
+        }
+        let previous = self.state.borrow().clone();
+        let invalidated = invalidate(&previous);
+        if invalidated != previous {
+            self.state.send_replace(invalidated.clone());
+        }
+        invalidated
+    }
+}
+
+async fn refresh_once(
+    configured_sid: &str,
+    state: &tokio::sync::watch::Sender<Snapshot>,
+    gate: Arc<RefreshGate>,
+    timeout: Duration,
+) {
+    let attempt = gate.next_attempt.fetch_add(1, Ordering::SeqCst) + 1;
+    gate.latest_attempt.store(attempt, Ordering::SeqCst);
+    let sid = configured_sid.to_string();
+    let gate_task = Arc::clone(&gate);
+    let task = tokio::task::spawn_blocking(move || {
+        if gate_task
+            .in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("a previous WTS snapshot query is still running".to_string());
+        }
+        let result = observe(&sid);
+        gate_task.in_flight.store(false, Ordering::SeqCst);
+        if gate_task.latest_attempt.load(Ordering::SeqCst) != attempt {
+            return Err("late WTS snapshot result discarded after timeout".to_string());
+        }
+        result.map_err(|error| error.to_string())
+    });
+
+    let result = match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!("WTS snapshot task failed: {error}")),
+        Err(_) => {
+            // Ensure the still-running blocking query can never publish its
+            // late result into a newer revision.
+            gate.latest_attempt
+                .store(attempt.wrapping_add(1), Ordering::SeqCst);
+            Err(format!(
+                "WTS snapshot query exceeded {} seconds",
+                timeout.as_secs()
+            ))
+        }
+    };
+
+    let previous = state.borrow().clone();
+    let next = match result {
+        Ok(observation) => apply_observation(&previous, observation),
+        Err(error) => {
+            log::warn!("WTS snapshot refresh failed: {error}");
+            invalidate(&previous)
+        }
+    };
+    if next != previous {
+        state.send_replace(next);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn logon_identity_is_not_just_the_session_number() {
-        let mut s = Session {
-            id: 2,
+    fn access_requires_both_configured_host_and_user() {
+        let access = Access {
             user: "user".into(),
-            domain: "machine".into(),
-            logon: 100,
-            state: WTSActive,
+            host: "192.0.2.1".parse().unwrap(),
+            sid: "S-1-5-21-1".into(),
         };
-        let old = s.fingerprint();
-        assert!(s.matches("USER"));
-        assert!(s.matches("MACHINE\\USER"));
-        assert!(!s.matches("other"));
-        s.logon += 1;
-        assert_ne!(old, s.fingerprint());
-        s.logon = 0;
-        assert!(s.fingerprint().is_empty());
+        assert!(access.allows("192.0.2.1".parse().unwrap(), "USER"));
+        assert!(!access.allows("127.0.0.1".parse().unwrap(), "user"));
+        assert!(!access.allows("192.0.2.1".parse().unwrap(), "other"));
+        assert!(access.allows_optional_user("192.0.2.1".parse().unwrap(), None));
+        assert!(access.allows_optional_user("192.0.2.1".parse().unwrap(), Some("USER")));
+        assert!(!access.allows_optional_user("192.0.2.1".parse().unwrap(), Some("other")));
     }
-}
 
-pub fn current_active() -> (Option<u32>, Option<bool>) {
-    let mut id = 0;
-    unsafe {
-        if ProcessIdToSessionId(GetCurrentProcessId(), &mut id) == 0 {
-            return (None, None);
-        }
+    #[test]
+    fn poll_classification_distinguishes_gone_same_reuse_and_unknown() {
+        let sid = "S-1-5-21-1";
+        let expected = "0000000003C517EA";
+        assert_eq!(
+            classify_poll(false, None, None, sid, expected),
+            PollState::Gone
+        );
+        assert_eq!(
+            classify_poll(true, Some(sid), Some(expected), sid, expected),
+            PollState::Same
+        );
+        assert_eq!(
+            classify_poll(true, Some(sid), Some("0000000003D481ED"), sid, expected),
+            PollState::Reused
+        );
+        assert_eq!(
+            classify_poll(true, Some("S-1-5-21-2"), Some(expected), sid, expected),
+            PollState::Reused
+        );
+        // A lost identity read is unknown, never reused or gone.
+        assert_eq!(
+            classify_poll(true, Some(sid), None, sid, expected),
+            PollState::Unknown
+        );
+        assert_eq!(
+            classify_poll(true, None, Some(expected), sid, expected),
+            PollState::Unknown
+        );
     }
-    (Some(id), session(id).ok().map(|s| s.state == WTSActive))
-}
 
-pub fn inspect(user: &str) -> io::Result<Activity> {
-    let mut all = sessions(user)?;
-    if all.is_empty() {
-        return Ok(Activity {
-            session_id: 0,
-            user: user.into(),
-            fingerprint: String::new(),
-            windows: Some(0),
-            tray_icons: Some(0),
-            note: String::new(),
-        });
+    #[test]
+    fn logoff_outcomes_are_reported_without_false_success() {
+        assert_eq!(LogoffResult::Confirmed("ok".into()).outcome(), "confirmed");
+        assert_eq!(
+            LogoffResult::NotStarted("stale".into()).outcome(),
+            "not_started"
+        );
+        assert_eq!(LogoffResult::Failed("exit 1".into()).outcome(), "failed");
+        assert_eq!(LogoffResult::Unknown("timeout".into()).outcome(), "unknown");
+        assert_eq!(LogoffResult::Anomaly("reuse".into()).outcome(), "anomaly");
+        assert_ne!(
+            LogoffResult::Unknown("timeout".into()).outcome(),
+            "confirmed"
+        );
     }
-    let active: Vec<_> = all
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.state == WTSActive)
-        .map(|(i, _)| i)
-        .collect();
-    // Pro normally has one active user desktop, but may retain disconnected
-    // logons. State selects a target, not whether its applications are idle.
-    let selected = if active.len() == 1 {
-        Some(active[0])
-    } else if all.len() == 1 {
-        Some(0)
-    } else {
-        None
-    };
-    let Some(index) = selected else {
-        return Ok(Activity {
-            session_id: 0,
-            user: user.into(),
-            fingerprint: String::new(),
-            windows: None,
-            tray_icons: None,
-            note: "多个用户会话，无法唯一确定注销目标；仅允许保留或取消。".into(),
-        });
-    };
-    let s = all.remove(index);
-    let mut result = Activity {
-        session_id: s.id,
-        user: s.owner(),
-        fingerprint: s.fingerprint(),
-        windows: None,
-        tray_icons: None,
-        note: String::new(),
-    };
-    match probe(s.id) {
-        Ok(ui) => {
-            result.windows = ui.windows;
-            result.tray_icons = ui.tray_icons;
-            if ui.tray_icons.is_none() {
-                result.note = "无法可靠确认用户托盘状态，不会自动注销。".into()
-            }
-        }
-        Err(e) => result.note = format!("无法读取该会话的界面状态：{e}；不会自动注销。"),
-    }
-    Ok(result)
-}
-pub fn logoff(user: &str, id: u32, fingerprint: &str, require_empty: bool) -> io::Result<()> {
-    if id == 0 || fingerprint.is_empty() {
-        return Err(io::Error::other("an identified user session is required"));
-    }
-    let s = session(id)?;
-    if !s.matches(user) || s.fingerprint() != fingerprint {
-        return Err(io::Error::other(
-            "session owner or logon changed; refusing logoff",
-        ));
-    }
-    // The pre-dialog observation can go stale. Automatic logoff requires a
-    // fresh empty snapshot; explicit consent permits closing all target apps.
-    if require_empty {
-        let ui = probe(id)?;
-        if ui.windows != Some(0) || ui.tray_icons != Some(0) {
-            return Err(io::Error::other(
-                "session is no longer confirmed empty; refusing automatic logoff",
-            ));
-        }
-    }
-    if session(id)?.fingerprint() != fingerprint {
-        return Err(io::Error::other("session changed before logoff"));
-    }
-    unsafe {
-        if WTSLogoffSession(ptr::null_mut(), id, 1) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    if sessions(user)?
-        .iter()
-        .any(|s| s.id == id && s.fingerprint() == fingerprint)
-    {
-        return Err(io::Error::other("session logoff was not confirmed"));
-    }
-    Ok(())
-}
-struct ProbeDir(PathBuf);
-impl Drop for ProbeDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-struct Handle(HANDLE);
-impl Drop for Handle {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.0.is_null() {
-                CloseHandle(self.0);
-            }
-        }
-    }
-}
-fn probe(id: u32) -> io::Result<Ui> {
-    unsafe {
-        let mut token = ptr::null_mut();
-        if WTSQueryUserToken(id, &mut token) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let token = Handle(token);
-        let mut needed = 0;
-        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut needed);
-        let mut info = vec![0u8; needed as usize];
-        if GetTokenInformation(
-            token.0,
-            TokenUser,
-            info.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let mut sid = ptr::null_mut();
-        if ConvertSidToStringSidW(
-            ptr::read_unaligned(info.as_ptr() as *const TOKEN_USER)
-                .User
-                .Sid,
-            &mut sid,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let mut length = 0;
-        while *sid.add(length) != 0 {
-            length += 1
-        }
-        let sid_string = String::from_utf16_lossy(slice::from_raw_parts(sid, length));
-        LocalFree(sid.cast());
-        let mut nonce = [0u8; 16];
-        if windows_sys::Win32::Security::Cryptography::BCryptGenRandom(
-            ptr::null_mut(),
-            nonce.as_mut_ptr(),
-            16,
-            windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        ) < 0
-        {
-            return Err(io::Error::other("probe nonce generation failed"));
-        }
-        let name: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
-        let path = std::env::temp_dir().join(format!("rdp-session-probe-{name}"));
-        // These counts can authorize automatic logoff. Other local users must
-        // not be able to replace the helper's response with forged zero counts.
-        let sddl = wide(&format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{sid_string})"));
-        let mut descriptor = ptr::null_mut();
-        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.as_ptr(),
-            1,
-            &mut descriptor,
-            ptr::null_mut(),
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor,
-            bInheritHandle: 0,
-        };
-        let created = CreateDirectoryW(wide(&path.to_string_lossy()).as_ptr(), &sa);
-        let error = io::Error::last_os_error();
-        LocalFree(descriptor);
-        if created == 0 {
-            return Err(error);
-        }
-        let directory = ProbeDir(path);
-        let output = directory.0.join("activity.json");
-        let exe = std::env::current_exe()?;
-        // Windows paths cannot contain double quotes. Only fixed flags and absolute
-        // paths generated by this process appear in this private helper command line.
-        let mut cmd = wide(&format!(
-            "\"{}\" session-probe \"{}\"",
-            exe.display(),
-            output.display()
-        ));
-        let mut startup: STARTUPINFOW = mem::zeroed();
-        startup.cb = mem::size_of::<STARTUPINFOW>() as u32;
-        let mut desktop = wide("winsta0\\default");
-        startup.lpDesktop = desktop.as_mut_ptr();
-        startup.dwFlags = STARTF_USESHOWWINDOW;
-        startup.wShowWindow = 0;
-        let mut process: PROCESS_INFORMATION = mem::zeroed();
-        if CreateProcessAsUserW(
-            token.0,
-            wide(&exe.to_string_lossy()).as_ptr(),
-            cmd.as_mut_ptr(),
-            ptr::null(),
-            ptr::null(),
-            0,
-            CREATE_NO_WINDOW,
-            ptr::null(),
-            ptr::null(),
-            &startup,
-            &mut process,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let process_handle = Handle(process.hProcess);
-        let _thread_handle = Handle(process.hThread);
-        if WaitForSingleObject(process_handle.0, 8000) != WAIT_OBJECT_0 {
-            TerminateProcess(process_handle.0, 1);
-            WaitForSingleObject(process_handle.0, 1000);
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "session UI probe timed out",
-            ));
-        }
-        let raw = fs::read(&output)?;
-        if raw.len() > 65536 {
-            return Err(io::Error::other("oversized UI probe response"));
-        }
-        serde_json::from_slice(&raw).map_err(io::Error::other)
-    }
-}
-pub fn write_probe(path: &Path) -> io::Result<()> {
-    let ui = crate::session_ui::observe();
-    fs::write(path, serde_json::to_vec(&ui).map_err(io::Error::other)?)
 }
