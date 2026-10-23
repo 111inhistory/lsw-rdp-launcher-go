@@ -114,40 +114,12 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 func runWith(ctx context.Context, args []string, out, stderr io.Writer, frontend confirmFrontend) error {
 	flags := flag.NewFlagSet("rdp-launcher", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	showVersion := flags.Bool("version", false, "print version and commit hash without contacting the controller")
-	config := flags.String("config", host.DefaultConfigPath(), "TOML configuration")
-	socket := flags.String("socket", host.DefaultSocket(), "resident controller's Unix socket")
-	timeout := flags.Duration("timeout", 3*time.Minute, "client request timeout; 0 disables it")
-	onConflict := flags.String("on-conflict", "", "decide without prompting: current, keep, logoff or cancel")
-	flags.Usage = func() {
-		fmt.Fprintln(stderr, versionString())
-		fmt.Fprintln(stderr, `Usage: rdp-launcher [global flags] COMMAND [command flags] [arguments]
-
-  version                   Print version and commit hash; no controller needed
-  start                     Start the user service in the background; return when ready
-  serve / watcher           Run the controller in the foreground (debugging)
-  status                    Human-readable status and version; does not wake the VM
-  lock / unlock             Block / allow automatic disconnect, logoff, reclaim and suspend
-  shutdown                  Stop the controller and its owned FreeRDP process
-  ping                      Backend request; wakes the VM without starting RDP
-  desktop / remoteapp        Connect or safely switch the display mode
-  run [--params TEXT] [--working-dir PATH] TARGET
-  open [--app TARGET] FILE...   Open files as one ordered batch and one confirmation
-  apps                      Query Windows applications plus configured [[apps]]
-  sync-apps                 Cache applications, icons and .desktop entries
-  install-shortcuts         Install Windows desktop and cached app shortcuts locally
-  list-apps                 List cached and configured applications; no VM wake
-  mounts                    Query the interactive user's mapped drives
-  path [--to-linux] PATH    Convert using explicit [mounts] mappings
-  auth set / check / clear        Manage the RDP password keyring entry
-  auth agent set / check / clear  Manage the shared Windows agent token
-  show-config                     Print the loaded configuration
-
-Command flags precede positional arguments. Global flags precede COMMAND.
-An existing Windows login is handled by a Wayland window when the compositor
-socket is usable, otherwise on a terminal; --on-conflict decides without one.`)
-		flags.PrintDefaults()
-	}
+	showVersion := flags.Bool("version", false, "Print version and commit; no controller needed")
+	config := flags.String("config", host.DefaultConfigPath(), "Read TOML configuration from `FILE`")
+	socket := flags.String("socket", host.DefaultSocket(), "Connect to controller Unix socket at `PATH`")
+	timeout := flags.Duration("timeout", 3*time.Minute, "Client request timeout `DURATION`; 0 disables it")
+	onConflict := flags.String("on-conflict", "", "Choose `ACTION` without prompting: current, keep, logoff, cancel")
+	flags.Usage = func() { printRootHelp(stderr, flags) }
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -233,13 +205,7 @@ socket is usable, otherwise on a terminal; --on-conflict decides without one.`)
 		}
 		return startHost(ctx, *config, *socket, out)
 	case "status":
-		f := flag.NewFlagSet("status", flag.ContinueOnError)
-		f.SetOutput(stderr)
-		f.Usage = func() {
-			fmt.Fprintln(stderr, versionString())
-			fmt.Fprintln(stderr, "Usage: rdp-launcher status")
-			f.PrintDefaults()
-		}
+		f := commandFlags("status", "status", "Show controller, connection and memory status without waking the VM.", stderr)
 		if err := f.Parse(args); err != nil {
 			return err
 		}
@@ -351,10 +317,9 @@ socket is usable, otherwise on a terminal; --on-conflict decides without one.`)
 		}
 		return print(apps)
 	case "run":
-		f := flag.NewFlagSet("run", flag.ContinueOnError)
-		f.SetOutput(stderr)
-		params := f.String("params", "", "Windows argument string")
-		directory := f.String("working-dir", "", "Windows working directory")
+		f := commandFlags("run", "run [options] TARGET", "Start a Windows application by path, command or cached name/ID.\nAn existing desktop connection requires a choice before execution.", stderr)
+		params := f.String("params", "", "Pass Windows argument string `TEXT`")
+		directory := f.String("working-dir", "", "Use Windows working directory `PATH`")
 		if err := f.Parse(args); err != nil {
 			return err
 		}
@@ -379,9 +344,8 @@ socket is usable, otherwise on a terminal; --on-conflict decides without one.`)
 		}
 		return print(data)
 	case "open":
-		f := flag.NewFlagSet("open", flag.ContinueOnError)
-		f.SetOutput(stderr)
-		application := f.String("app", "", "Windows application target or cached name/ID; otherwise use the file association")
+		f := commandFlags("open", "open [options] [FILE...]", "Open files in order, with one confirmation for the whole batch.\nWithout --app, use file associations. With --app, files are optional.", stderr)
+		application := f.String("app", "", "Use application `TARGET` (path, command or cached name/ID)")
 		if err := f.Parse(args); err != nil {
 			return err
 		}
@@ -436,9 +400,8 @@ socket is usable, otherwise on a terminal; --on-conflict decides without one.`)
 		}
 		return err
 	case "path":
-		f := flag.NewFlagSet("path", flag.ContinueOnError)
-		f.SetOutput(stderr)
-		toLinux := f.Bool("to-linux", false, "convert Windows drive path to host path")
+		f := commandFlags("path", "path [options] PATH", "Convert paths using configured [mounts]; defaults to Linux -> Windows.", stderr)
+		toLinux := f.Bool("to-linux", false, "Convert Windows drive path to Linux path instead")
 		if err := f.Parse(args); err != nil {
 			return err
 		}
