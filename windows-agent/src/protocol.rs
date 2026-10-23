@@ -424,7 +424,7 @@ mod tests {
     fn reference() -> SessionRef {
         SessionRef {
             session_id: 4,
-            authentication_id: "0000000003C517EA".into(),
+            authentication_id: "00000000000003E7".into(),
             boot_identifier: "11111111-2222-4333-8444-555555555555".into(),
         }
     }
@@ -433,7 +433,7 @@ mod tests {
     fn session_reference_uses_the_approved_field_names_and_validation() {
         let value = serde_json::to_value(reference()).unwrap();
         assert_eq!(value["session_id"], 4);
-        assert_eq!(value["authentication_id"], "0000000003C517EA");
+        assert_eq!(value["authentication_id"], "00000000000003E7");
         assert_eq!(
             value["boot_identifier"],
             "11111111-2222-4333-8444-555555555555"
@@ -446,11 +446,11 @@ mod tests {
                 ..reference()
             },
             SessionRef {
-                authentication_id: "0000000003c517ea".into(),
+                authentication_id: "00000000000003e7".into(),
                 ..reference()
             },
             SessionRef {
-                authentication_id: "0000000003C517E".into(),
+                authentication_id: "00000000000003E".into(),
                 ..reference()
             },
             SessionRef {
@@ -465,24 +465,24 @@ mod tests {
     #[test]
     fn boot_identifiers_compare_without_case_folding_the_raw_reference() {
         assert!(same_boot_identifier(
-            "11111111-2222-4333-8444-555555555555",
-            "AF319887-9FD7-11F1-B633-EF01453EABE6"
+            "aa11bb22-cc33-44dd-88ee-ff0011223344",
+            "AA11BB22-CC33-44DD-88EE-FF0011223344"
         ));
         assert!(!same_boot_identifier(
-            "11111111-2222-4333-8444-555555555555",
-            "af319887-9fd7-11f1-b633-ef01453eabe7"
+            "aa11bb22-cc33-44dd-88ee-ff0011223344",
+            "aa11bb22-cc33-44dd-88ee-ff0011223345"
         ));
     }
 
     #[test]
     fn formats_luid_guid_and_wts_client_addresses() {
-        assert_eq!(format_authentication_id(0, 0x03C5_17EA), "0000000003C517EA");
+        assert_eq!(format_authentication_id(0, 0x03E7), "00000000000003E7");
         assert_eq!(
             format_guid(
-                0xaf31_9887,
-                0x9fd7,
-                0x11f1,
-                [0xb6, 0x33, 0xef, 0x01, 0x45, 0x3e, 0xab, 0xe6]
+                0x1111_1111,
+                0x2222,
+                0x4333,
+                [0x84, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55]
             ),
             "11111111-2222-4333-8444-555555555555"
         );
@@ -589,7 +589,7 @@ mod tests {
             user: "user".into(),
             domain: "machine".into(),
             state: 0,
-            client_name: "lswD2210a001".into(),
+            client_name: "rdp-test-client".into(),
             client_address: "192.0.2.10".into(),
             logon_time: 100,
             connect_time: 200,

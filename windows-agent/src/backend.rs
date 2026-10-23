@@ -76,7 +76,7 @@ mod tests {
     fn session_status_response_reports_the_user_worker_activity() {
         let reference = crate::protocol::SessionRef {
             session_id: 4,
-            authentication_id: "0000000003C517EA".into(),
+            authentication_id: "00000000000003E7".into(),
             boot_identifier: "11111111-2222-4333-8444-555555555555".into(),
         };
         let status = crate::protocol::WorkerSessionStatus {
@@ -114,7 +114,7 @@ mod tests {
             "protocol": 2,
             "session_ref": {
                 "session_id": 4,
-                "authentication_id": "0000000003C517EA",
+                "authentication_id": "00000000000003E7",
                 "boot_identifier": "11111111-2222-4333-8444-555555555555"
             }
         }))
@@ -126,7 +126,7 @@ mod tests {
             "target": "notepad.exe",
             "session_ref": {
                 "session_id": 4,
-                "authentication_id": "0000000003C517EA",
+                "authentication_id": "00000000000003E7",
                 "boot_identifier": "11111111-2222-4333-8444-555555555555"
             }
         }))

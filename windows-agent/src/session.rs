@@ -1083,7 +1083,7 @@ mod tests {
     #[test]
     fn poll_classification_distinguishes_gone_same_reuse_and_unknown() {
         let sid = "S-1-5-21-1";
-        let expected = "0000000003C517EA";
+        let expected = "00000000000003E7";
         assert_eq!(
             classify_poll(false, None, None, sid, expected),
             PollState::Gone
@@ -1093,7 +1093,7 @@ mod tests {
             PollState::Same
         );
         assert_eq!(
-            classify_poll(true, Some(sid), Some("0000000003D481ED"), sid, expected),
+            classify_poll(true, Some(sid), Some("00000000000003E8"), sid, expected),
             PollState::Reused
         );
         assert_eq!(

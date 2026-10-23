@@ -43,7 +43,7 @@ func displayTestConfig() DisplayConfig {
 		Host:              "192.0.2.10",
 		User:              "test-user",
 		Program:           `C:\Program Files\RemoteApp\agent.exe`,
-		ClientHostname:    "lswD2210a001",
+		ClientHostname:    "rdp-test-client",
 		VideoDriver:       "wayland",
 		ScaleDesktop:      200,
 		Clipboard:         true,
@@ -94,7 +94,7 @@ func TestFreeRDPArgumentsStdinAndOwnedExit(t *testing.T) {
 			args := strings.Join(capture.Args, " ")
 			wantArgs := []string{
 				"/v:192.0.2.10", "/u:test-user", "/from-stdin:force",
-				"/client-hostname:lswD2210a001", "+clipboard", "/cert:ignore", "/scale-desktop:200",
+				"/client-hostname:rdp-test-client", "+clipboard", "/cert:ignore", "/scale-desktop:200",
 			}
 			if tc.desktop {
 				wantArgs = append(wantArgs, "/f", "+dynamic-resolution")
@@ -194,7 +194,7 @@ func TestRemoteAppUsesShellKeepaliveWithoutHostEndpoint(t *testing.T) {
 	if !strings.Contains(joined, `cmd:remoteapp-shell`) {
 		t.Fatal(joined)
 	}
-	if !strings.Contains(joined, `/client-hostname:lswD2210a001`) {
+	if !strings.Contains(joined, `/client-hostname:rdp-test-client`) {
 		t.Fatal(joined)
 	}
 	for _, forbidden := range []string{"--bind", "--auth-token-file", "49152", "daemon", "test-only-password"} {

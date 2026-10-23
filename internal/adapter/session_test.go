@@ -99,7 +99,7 @@ func bindingSession(agent Agent) *Session {
 		agent:       agent,
 		sessionUser: "user",
 		display: &Display{
-			config: DisplayConfig{ClientHostname: "lswD2210a001"},
+			config: DisplayConfig{ClientHostname: "rdp-test-client"},
 			exited: make(chan struct{}),
 		},
 	}
@@ -107,7 +107,7 @@ func bindingSession(agent Agent) *Session {
 
 func TestWaitBindingPermitsOnlyWorkerConfirmedActiveLogon(t *testing.T) {
 	ref := sampleRef()
-	login := bindingLogin("lswD2210a001", "S-1-5-21-1", "user", controller.WTSActive, ref)
+	login := bindingLogin("rdp-test-client", "S-1-5-21-1", "user", controller.WTSActive, ref)
 	var statusCalls atomic.Int32
 	agent := jsonAgent(t, func(req agentRequest) any {
 		switch req.Action {
@@ -135,7 +135,7 @@ func TestWaitBindingPermitsOnlyWorkerConfirmedActiveLogon(t *testing.T) {
 
 func TestWaitBindingIgnoresBaselineLogonUntilConnectTimeChanges(t *testing.T) {
 	ref := sampleRef()
-	hostname := "lswD2210a001"
+	hostname := "rdp-test-client"
 	old := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, ref)
 	reconnected := old
 	reconnected.ConnectTime = old.ConnectTime + 100
@@ -175,8 +175,8 @@ func TestWaitBindingIgnoresBaselineLogonUntilConnectTimeChanges(t *testing.T) {
 
 func TestWaitBindingOverlapAcceptsOnlyNewLogon(t *testing.T) {
 	oldRef := sampleRef()
-	newRef := controller.SessionRef{SessionID: oldRef.SessionID + 2, AuthenticationID: "0000000003D481ED", BootIdentifier: oldRef.BootIdentifier}
-	hostname := "lswD2210a001"
+	newRef := controller.SessionRef{SessionID: oldRef.SessionID + 2, AuthenticationID: "00000000000003E8", BootIdentifier: oldRef.BootIdentifier}
+	hostname := "rdp-test-client"
 	old := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, oldRef)
 	created := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, newRef)
 	created.ConnectTime = old.ConnectTime + 100
@@ -212,7 +212,7 @@ func TestWaitBindingOverlapAcceptsOnlyNewLogon(t *testing.T) {
 
 func TestWaitBindingRejectsUnconfirmedOrAmbiguousLogons(t *testing.T) {
 	ref := sampleRef()
-	hostname := "lswD2210a001"
+	hostname := "rdp-test-client"
 	matching := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, ref)
 	cases := []struct {
 		name       string
@@ -244,7 +244,7 @@ func TestWaitBindingRejectsUnconfirmedOrAmbiguousLogons(t *testing.T) {
 		{
 			name: "multiple active matches",
 			snapshot: bindingSnapshot(1, true, matching,
-				bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, controller.SessionRef{SessionID: 6, AuthenticationID: "0000000003D481ED", BootIdentifier: ref.BootIdentifier})),
+				bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, controller.SessionRef{SessionID: 6, AuthenticationID: "00000000000003E8", BootIdentifier: ref.BootIdentifier})),
 			wantErr: "multiple active logons",
 		},
 		{
@@ -261,7 +261,7 @@ func TestWaitBindingRejectsUnconfirmedOrAmbiguousLogons(t *testing.T) {
 			snapshot: bindingSnapshot(1, true, matching),
 			status: func(controller.SessionRef) any {
 				other := ref
-				other.AuthenticationID = "0000000003D481ED"
+				other.AuthenticationID = "00000000000003E8"
 				return workerStatusReply(other, matching.SID, `MACHINE\user`, true)
 			},
 			wantErr:    "worker did not confirm",
@@ -624,7 +624,7 @@ func startDisplaySession(t *testing.T, agent Agent) (*Session, context.Context, 
 
 func TestStartDisplayBindsOnlyAfterWorkerConfirmation(t *testing.T) {
 	ref := sampleRef()
-	login := bindingLogin("lswD2210a001", "S-1-5-21-1", "user", controller.WTSActive, ref)
+	login := bindingLogin("rdp-test-client", "S-1-5-21-1", "user", controller.WTSActive, ref)
 	var inspects atomic.Int32
 	agent := jsonAgent(t, func(req agentRequest) any {
 		switch req.Action {
@@ -661,8 +661,8 @@ func TestStartDisplayBindsOnlyAfterWorkerConfirmation(t *testing.T) {
 
 func TestStartDisplayUsesPreSpawnBaselineToIgnoreLingeringLogon(t *testing.T) {
 	oldRef := sampleRef()
-	newRef := controller.SessionRef{SessionID: oldRef.SessionID + 2, AuthenticationID: "0000000003D481ED", BootIdentifier: oldRef.BootIdentifier}
-	hostname := "lswD2210a001"
+	newRef := controller.SessionRef{SessionID: oldRef.SessionID + 2, AuthenticationID: "00000000000003E8", BootIdentifier: oldRef.BootIdentifier}
+	hostname := "rdp-test-client"
 	old := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, oldRef)
 	created := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, newRef)
 	created.ConnectTime = old.ConnectTime + 100

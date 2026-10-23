@@ -304,11 +304,8 @@ fn sanitize_id(name: &str) -> String {
         "设置" => return "settings".to_string(),
         "Windows 安全中心" => return "windows-security".to_string(),
         "Windows 备份" => return "windows-backup".to_string(),
-        "图吧工具箱" => return "tb-toolbox".to_string(),
-        "UU远程" => return "uu-remote".to_string(),
         "入门" => return "get-started".to_string(),
         "单击以执行" => return "click-to-do".to_string(),
-        "Office 语言首选项" => return "office-language-preferences".to_string(),
         _ => {}
     }
 

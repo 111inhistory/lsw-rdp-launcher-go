@@ -38,7 +38,7 @@ func bindingLogin(id uint32) Login {
 		Domain:        "DOMAIN",
 		State:         WTSActive,
 		ClientName:    "rdp-launcher",
-		ClientAddress: "10.0.0.2",
+		ClientAddress: "192.0.2.1",
 		LogonTime:     1000,
 		ConnectTime:   2000,
 	}
