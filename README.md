@@ -208,4 +208,4 @@ RDP_LIVE_BACKGROUND=192.0.2.14:49253 \
 
 同文件中的 `TestLiveBackgroundWatchQuiet` 会等待 32 秒，再通过 `ssh win11 'Start-Sleep -Seconds 2'` 产生状态变化，以验证同一安静连接仍可收消息。只在专用测试环境显式运行。
 
-迁移验证见 [docs/windows-validation.md](docs/windows-validation.md)，内存与真实暂停恢复验证见 [docs/memory-validation.md](docs/memory-validation.md)。
+历史迁移验证见 [docs/windows-validation.md](docs/windows-validation.md)，新 Agent 隔离实测与断开 ConnectTime 原始证据见 [docs/connecttime-validation.md](docs/connecttime-validation.md)，内存与真实暂停恢复验证见 [docs/memory-validation.md](docs/memory-validation.md)。

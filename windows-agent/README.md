@@ -207,4 +207,4 @@ CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
 
 ## 验证范围
 
-见 [Windows 验证记录](../docs/windows-validation.md)。本版完成了协议 2、快照、用户 worker 路由和 SYSTEM `logoff.exe` 实现及跨目标编译检查；**尚未在真实 Windows 上执行，也未部署。** 需要在测试后台/临时登录中单独验收：worker 就绪与用户桌面执行、SessionRef 失效与 ID 复用、注销超时/非零退出/断线/异步确认、WTS 查询超时后的 stale 行为，以及 RemoteApp keepalive 不再作为请求入口。旧 `WTSLogoffSession` 的 `0xC0000005` 根因仍独立核实，本实现不依赖该路径。
+历史记录见 [Windows 验证记录](../docs/windows-validation.md)，新实现验证见 [2026-10-23 隔离实测](../docs/connecttime-validation.md)。协议 2 快照、本机管道与用户 worker 就绪、RD/RemoteApp 绑定、用户桌面查询与 Win32 执行、SYSTEM `logoff.exe` 精确目标注销确认已在真实 Windows 隔离环境执行，**未替换生产安装**。仍需验收 SessionRef 失效与 ID 复用、注销超时/非零退出/断线/异步确认、WTS 查询超时后的 stale 行为、无 SSH 阻挡的空闲自动注销及完整 CLI/GUI 流程。旧 `WTSLogoffSession` 的 `0xC0000005` 根因仍独立核实，本实现不依赖该路径。
