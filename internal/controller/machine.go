@@ -36,19 +36,20 @@ const (
 // The business payload survives connection changes and a single confirmation.
 // Confirm belongs to the requesting IPC connection, never to a resident GUI.
 type Request struct {
-	Action     string                                                      `json:"action"`
-	Target     string                                                      `json:"target,omitempty"`
-	Params     string                                                      `json:"params,omitempty"`
-	WorkingDir string                                                      `json:"working_dir,omitempty"`
-	WithIcons  bool                                                        `json:"with_icons,omitempty"`
-	File       string                                                      `json:"file,omitempty"`
-	Mode       string                                                      `json:"mode,omitempty"`
-	Choice     SwitchDecision                                              `json:"choice,omitempty"`
-	Batch      []Request                                                   `json:"batch,omitempty"`
-	Confirm    func(context.Context, SwitchPrompt) (SwitchDecision, error) `json:"-"`
+	Action      string                                                      `json:"action"`
+	Target      string                                                      `json:"target,omitempty"`
+	Params      string                                                      `json:"params,omitempty"`
+	WorkingDir  string                                                      `json:"working_dir,omitempty"`
+	WithIcons   bool                                                        `json:"with_icons,omitempty"`
+	File        string                                                      `json:"file,omitempty"`
+	UserContext bool                                                        `json:"user_context"`
+	Mode        string                                                      `json:"mode,omitempty"`
+	Choice      SwitchDecision                                              `json:"choice,omitempty"`
+	Batch       []Request                                                   `json:"batch,omitempty"`
+	Confirm     func(context.Context, SwitchPrompt) (SwitchDecision, error) `json:"-"`
 }
 
-func (r Request) NeedsUser() bool { return r.Mode != "" }
+func (r Request) NeedsUser() bool { return r.UserContext }
 
 type Result struct {
 	Data any
@@ -101,6 +102,7 @@ type Operation struct {
 	Request              Request
 	Activity             SessionActivity
 	Prompt               SwitchPrompt
+	Deadline             time.Time
 	MemoryTarget         uint64
 	ResumeSafe           bool
 	MemoryPrepared       bool
@@ -194,6 +196,9 @@ type machine struct {
 	backendStreamGeneration     uint64
 	backendStreamInvalid        bool
 	idleGeneration              uint64
+	idleLogoffInspected         bool
+	idleLogoffRetryAt           time.Time
+	idleLogoffTransitionUntil   time.Time
 }
 
 func newMachine(opts Options) *machine {
@@ -359,6 +364,7 @@ func (m *machine) displayExited(id uint64, err error) {
 	m.state.DisplayMode = ""
 	m.displayID = 0
 	m.cleanupDisplay = false
+	m.invalidateSessions()
 	m.resetTimers()
 	if err != nil {
 		m.state.LastError = err
@@ -371,6 +377,9 @@ func (m *machine) resetTimers() {
 	m.state.LogoffDeadline = time.Time{}
 	m.idleSince = time.Time{}
 	m.idleLogoffDone = false
+	m.idleLogoffInspected = false
+	m.idleLogoffRetryAt = time.Time{}
+	m.idleLogoffTransitionUntil = time.Time{}
 	m.logoffReclaim = false
 	m.state.BlockingReason = ""
 	m.memoryCancelReclaim()
@@ -411,6 +420,9 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 	if out.Err != nil {
 		if op.Source == SourceIdle && (op.Kind == InspectSession || op.Kind == LogoffSession) {
 			m.state.LastError = out.Err
+			if op.idleGeneration != m.idleGeneration {
+				return
+			}
 			m.skipIdleLogoff(out.Err.Error())
 			return
 		}
@@ -461,6 +473,12 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 		m.sessions(*out.Sessions)
 	}
 	if op.Source == SourceIdle && op.Kind == InspectSession {
+		if op.idleGeneration != m.idleGeneration {
+			return
+		}
+		if out.Sessions != nil && out.Sessions.Fresh {
+			m.idleLogoffInspected = true
+		}
 		if out.Sessions == nil || !out.Sessions.Fresh {
 			m.skipIdleLogoff("current session snapshot unavailable")
 		}
@@ -518,6 +536,7 @@ func (m *machine) done(id uint64, out Outcome, now time.Time) {
 		m.displayID = op.ID
 		m.cleanupDisplay = op.revision != m.revision
 	case StopDisplay:
+		m.invalidateSessions()
 		m.state.DisplayDeadline = time.Time{}
 		m.state.Display = false
 		m.state.DisplayMode = ""
@@ -540,8 +559,14 @@ func (m *machine) begin(kind Kind, j *job, source OperationSource) *Operation {
 	if m.state.Binding != nil {
 		op.Reference = m.state.Binding.Reference
 	}
+	if source == SourceIdle && kind == InspectSession {
+		op.Deadline = m.idleLogoffTransitionUntil
+	}
 	if j != nil {
 		op.Request = j.request
+		if kind == StartDisplay && op.Request.Mode == "" {
+			op.Request.Mode = ModeRemoteApp
+		}
 		if m.switching != nil && m.switching.job == j {
 			op.Activity = m.switching.activity
 			if kind == LogoffSession && op.Activity.Reference.Valid() {
@@ -635,7 +660,7 @@ func (m *machine) next(now time.Time) *Operation {
 			return nil
 		}
 		if head.request.NeedsUser() {
-			conflict := m.state.Display && head.request.Mode != m.state.DisplayMode
+			conflict := m.state.Display && head.request.Mode != "" && head.request.Mode != m.state.DisplayMode
 			if conflict || m.switching != nil {
 				if op := m.switchNext(head); op != nil {
 					return op
@@ -668,6 +693,9 @@ func (m *machine) deadline() time.Time {
 	}
 	if m.memory.Reclaiming && m.memory.Awaiting && !m.state.SuspendDeadline.IsZero() && m.memory.deadline.After(m.state.SuspendDeadline) {
 		return m.memoryDeadline()
+	}
+	if !m.idleLogoffRetryAt.IsZero() && !m.idleLogoffDone {
+		return earlier(m.idleLogoffRetryAt, m.memoryDeadline())
 	}
 	a, b := m.state.DisplayDeadline, m.state.SuspendDeadline
 	return earlier(earlier(earlier(a, b), m.state.LogoffDeadline), m.memoryDeadline())

@@ -109,7 +109,7 @@ func TestBackendStreamFencesLateEventsAcrossReplacement(t *testing.T) {
 	h.wait(t, func(s Snapshot) bool { return s.BackendReady })
 
 	login := bindingLogin(2)
-	result := h.request(h.ctx, Request{Action: "run", Mode: ModeRemoteApp})
+	result := h.request(h.ctx, Request{Action: "run", Mode: ModeRemoteApp, UserContext: true})
 	h.expect(t, StartDisplay)
 	snapshot := sessionSnapshot(login)
 	h.complete(t, Outcome{Binding: &login, Sessions: &snapshot})
@@ -182,12 +182,12 @@ func TestDisplayExitDuringConfirmationInvalidatesChoice(t *testing.T) {
 	if m.switching != nil || len(m.queue) != 0 {
 		t.Fatal("confirmation survived the owned display exit", m.snapshot())
 	}
-	if len(m.completed) != 1 || m.completed[0].result.Err == nil || !strings.Contains(m.completed[0].result.Err.Error(), "owned connection changed") {
+	if len(m.completed) != 1 || m.completed[0].result.Err == nil || !strings.Contains(m.completed[0].result.Err.Error(), "during confirm-switch") {
 		t.Fatal(m.completed)
 	}
-	// WTS remains Active in the fixture: the exited display did not invalidate
-	// the snapshot or start a logoff.
-	if !m.state.Sessions.Fresh || m.state.Display {
+	// WTS remains Active in the fixture; the display exit invalidated the
+	// session cache but must not start a logoff.
+	if m.state.Sessions.Fresh || m.state.Display {
 		t.Fatal(m.snapshot())
 	}
 }
@@ -280,7 +280,7 @@ func TestLateIdleLogoffDoesNotReclaimUnderInvalidatedPlan(t *testing.T) {
 		at := autoDisconnect(t, m, epoch)
 		inspect := expectOp(t, m, at, InspectSession)
 		disconnected := binding
-		disconnected.State = 4
+		disconnected.State = WTSDisconnected
 		m.done(inspect.ID, Outcome{Sessions: snapshotAt(at, disconnected)}, at)
 		logoff := expectOp(t, m, at, LogoffSession)
 		if logoff.Source != SourceIdle {

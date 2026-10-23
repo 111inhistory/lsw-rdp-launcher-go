@@ -173,7 +173,7 @@ func TestCancelReachesExecutor(t *testing.T) {
 }
 func TestLoopUserRequestWaitsForBackendThenBindsBeforeDispatch(t *testing.T) {
 	h := newHarness(t)
-	result := h.request(h.ctx, Request{Action: "run", Mode: ModeRemoteApp})
+	result := h.request(h.ctx, Request{Action: "run", Mode: ModeRemoteApp, UserContext: true})
 	h.wait(t, func(s Snapshot) bool { return s.Queued == 1 })
 	select {
 	case op := <-h.operations:

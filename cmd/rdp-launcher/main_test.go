@@ -84,7 +84,7 @@ working_dir='C:\Windows'
 				t.Fatalf("wrong envelope: %+v", req)
 			}
 			got := req.Request
-			if got.Action != tc.action || got.Mode != tc.mode || got.Batch != nil || got.Choice != "" {
+			if got.Action != tc.action || !got.UserContext || got.Mode != tc.mode || got.Batch != nil || got.Choice != "" {
 				t.Fatalf("wrong request: %+v", got)
 			}
 			switch tc.action {
@@ -99,6 +99,70 @@ working_dir='C:\Windows'
 			}
 		})
 	}
+}
+
+func TestUserQueriesAreModeNeutralAndUserContext(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		command   string
+		action    string
+		withIcons bool
+	}{
+		{"apps", "apps", "list_apps", false},
+		{"sync-apps", "sync-apps", "list_apps", true},
+		{"mounts", "mounts", "get_mapped_drives", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
+			t.Setenv("XDG_DATA_HOME", filepath.Join(root, "data"))
+			path := filepath.Join(root, "config.toml")
+			if err := os.WriteFile(path, []byte("# fixture\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			socket := filepath.Join(root, "controller.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			received := serveHostOnce(t, listener, func(_ *json.Decoder, encoder *json.Encoder, _ host.Request) {
+				_ = encoder.Encode(host.Response{Type: "result", Data: json.RawMessage(`{"protocol":2,"status":"ok","apps":[]}`)})
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			var out, stderr bytes.Buffer
+			if err = run(ctx, []string{"--config", path, "--socket", socket, tc.command}, &out, &stderr); err != nil {
+				t.Fatal(err, stderr.String())
+			}
+			request := <-received
+			got := request.Request
+			// Read-only user queries must not imply a display mode or a reconnect.
+			if request.Action != "request" || got.Action != tc.action || !got.UserContext || got.Mode != "" || got.WithIcons != tc.withIcons {
+				t.Fatalf("wrong query request: %+v", request)
+			}
+		})
+	}
+	t.Run("ping", func(t *testing.T) {
+		root := t.TempDir()
+		socket := filepath.Join(root, "controller.sock")
+		listener, err := net.Listen("unix", socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		received := serveHostOnce(t, listener, nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		var out, stderr bytes.Buffer
+		if err = run(ctx, []string{"--socket", socket, "ping"}, &out, &stderr); err != nil {
+			t.Fatal(err, stderr.String())
+		}
+		request := <-received
+		if request.Request.Action != "ping" || request.Request.UserContext || request.Request.Mode != "" {
+			t.Fatalf("ping is not backend-only: %+v", request.Request)
+		}
+	})
 }
 
 func TestOpenBatchIsOneRequestAndOneConfirmation(t *testing.T) {
@@ -125,7 +189,7 @@ working_dir='C:\Windows'
 			t.Errorf("wrong batch envelope: %+v", request)
 			return
 		}
-		if request.Request.Mode != controller.ModeRemoteApp || request.Request.Choice != "" {
+		if !request.Request.UserContext || request.Request.Mode != controller.ModeRemoteApp || request.Request.Choice != "" {
 			t.Errorf("wrong batch mode/choice: %+v", request.Request)
 		}
 		batch := request.Request.Batch
@@ -138,7 +202,7 @@ working_dir='C:\Windows'
 			if item.Action != "run" || item.Target != `C:\Windows\explorer.exe` || !strings.Contains(item.Params, name) || item.WorkingDir != `C:\Windows` {
 				t.Errorf("batch item %d lost its payload: %+v", index, item)
 			}
-			if item.Batch != nil || item.Choice != "" || item.Confirm != nil || item.Mode != "" {
+			if item.Batch != nil || item.Choice != "" || item.Confirm != nil || item.Mode != "" || item.UserContext {
 				t.Errorf("batch item is not plain business payload: %+v", item)
 			}
 		}
@@ -223,7 +287,7 @@ func TestOpenExplicitChoiceNeedsNoPrompt(t *testing.T) {
 		t.Fatal(err, stderr.String())
 	}
 	request := <-received
-	if request.Request.Choice != controller.SwitchLogoff || request.Request.Action != "open" {
+	if request.Request.Choice != controller.SwitchLogoff || request.Request.Action != "open" || !request.Request.UserContext || request.Request.Mode != controller.ModeRemoteApp {
 		t.Fatalf("explicit choice was not sent once: %+v", request.Request)
 	}
 }

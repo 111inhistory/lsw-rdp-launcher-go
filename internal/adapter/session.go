@@ -56,6 +56,21 @@ func Open(ctx context.Context, cfg Config) (*Session, error) {
 	return s, nil
 }
 
+func operationTimeout(kind controller.Kind) time.Duration {
+	switch kind {
+	case controller.StartDisplay:
+		return 90 * time.Second
+	case controller.InspectSession:
+		return 30 * time.Second
+	case controller.LogoffSession:
+		// Keep the operation budget at least as large as the agent call it
+		// contains; logoff confirmation intentionally outlives 30 seconds.
+		return agentTimeout("logoff_session")
+	default:
+		return 15 * time.Second
+	}
+}
+
 func (s *Session) execute(ctx context.Context, op controller.Operation) controller.Outcome {
 	if op.Kind == controller.Dispatch {
 		return s.dispatch(ctx, op)
@@ -72,15 +87,17 @@ func (s *Session) execute(ctx context.Context, op controller.Operation) controll
 		choice, err := op.Request.Confirm(ctx, op.Prompt)
 		return controller.Outcome{Decision: choice, Err: err}
 	}
-	timeout := 15 * time.Second
-	if op.Kind == controller.StartDisplay {
-		timeout = 90 * time.Second
+	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, operationTimeout(op.Kind))
+	defer timeoutCancel()
+	ctx = timeoutCtx
+	if !op.Deadline.IsZero() {
+		// A transition deadline is an absolute total budget, not a fresh
+		// per-inspection timeout. WithDeadline also preserves a shorter caller
+		// deadline.
+		deadlineCtx, deadlineCancel := context.WithDeadline(ctx, op.Deadline)
+		defer deadlineCancel()
+		ctx = deadlineCtx
 	}
-	if op.Kind == controller.InspectSession || op.Kind == controller.LogoffSession {
-		timeout = 30 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	switch op.Kind {
 	case controller.QueryVM, controller.SuspendVM:
 		return s.vm.Execute(ctx, op)
@@ -173,7 +190,7 @@ func (s *Session) waitBinding(ctx context.Context, before *controller.SessionSna
 		if snapshot != nil && snapshot.Fresh {
 			var selected *controller.Login
 			for _, login := range snapshot.Sessions {
-				if login.State != 0 || !login.Reference.Valid() || login.SID == "" || !strings.EqualFold(login.ClientName, s.display.config.hostname()) {
+				if login.State != controller.WTSActive || !login.Reference.Valid() || login.SID == "" || !strings.EqualFold(login.ClientName, s.display.config.hostname()) {
 					continue
 				}
 				if before != nil {

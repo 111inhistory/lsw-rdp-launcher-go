@@ -220,11 +220,12 @@ func TestCurrentDesktopChoicePreservesPayloadAndSkipsReconnect(t *testing.T) {
 	j := &job{
 		ctx: context.Background(),
 		request: Request{
-			Action:     "open",
-			Target:     `C:\Users\user\report.txt`,
-			Params:     "--read-only",
-			WorkingDir: `C:\Users\user`,
-			Mode:       ModeRemoteApp,
+			Action:      "open",
+			Target:      `C:\Users\user\report.txt`,
+			Params:      "--read-only",
+			WorkingDir:  `C:\Users\user`,
+			Mode:        ModeRemoteApp,
+			UserContext: true,
 		},
 		reply: make(chan Result, 1),
 	}
@@ -268,4 +269,30 @@ func TestConnectRequestDoesNotOfferCurrentDesktop(t *testing.T) {
 		t.Fatal("connect request offered to run in the current desktop", confirm.Prompt)
 	}
 	m.done(confirm.ID, Outcome{Decision: SwitchCancel}, epoch)
+}
+
+func TestDesktopRunOrOpenWithEmptyActivityStillConfirmsWithCurrent(t *testing.T) {
+	for _, action := range []string{"run", "open"} {
+		t.Run(action, func(t *testing.T) {
+			m := testMachine()
+			oldDisplay := displayReadyMode(t, m, ModeDesktop)
+			binding := *m.state.Binding
+			zero := uint32(0)
+			login := bindingLogin(2)
+			login.Windows, login.TrayIcons = &zero, &zero
+			addJob(m, action, ModeRemoteApp)
+			inspect := expectOp(t, m, epoch, InspectSession)
+			m.done(inspect.ID, Outcome{Sessions: activitySnapshot(login)}, epoch)
+			confirm := expectOp(t, m, epoch, ConfirmSwitch)
+			if !confirm.Prompt.Activity.Empty() || !confirm.Prompt.Allows(SwitchCurrent) {
+				t.Fatal("empty desktop app request skipped confirmation/current", confirm.Prompt)
+			}
+			m.done(confirm.ID, Outcome{Decision: SwitchCurrent}, epoch)
+			dispatch := expectOp(t, m, epoch, Dispatch)
+			if dispatch.Reference != binding.Reference || m.displayID != oldDisplay {
+				t.Fatal("current desktop choice did not keep the exact bound login", dispatch, m.snapshot())
+			}
+			m.done(dispatch.ID, Outcome{}, epoch)
+		})
+	}
 }

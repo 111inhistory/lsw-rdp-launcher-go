@@ -107,7 +107,7 @@ func bindingSession(agent Agent) *Session {
 
 func TestWaitBindingPermitsOnlyWorkerConfirmedActiveLogon(t *testing.T) {
 	ref := sampleRef()
-	login := bindingLogin("lswD2210a001", "S-1-5-21-1", "user", 0, ref)
+	login := bindingLogin("lswD2210a001", "S-1-5-21-1", "user", controller.WTSActive, ref)
 	var statusCalls atomic.Int32
 	agent := jsonAgent(t, func(req agentRequest) any {
 		switch req.Action {
@@ -136,7 +136,7 @@ func TestWaitBindingPermitsOnlyWorkerConfirmedActiveLogon(t *testing.T) {
 func TestWaitBindingIgnoresBaselineLogonUntilConnectTimeChanges(t *testing.T) {
 	ref := sampleRef()
 	hostname := "lswD2210a001"
-	old := bindingLogin(hostname, "S-1-5-21-1", "user", 0, ref)
+	old := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, ref)
 	reconnected := old
 	reconnected.ConnectTime = old.ConnectTime + 100
 	before := bindingSnapshot(1, true, old)
@@ -177,8 +177,8 @@ func TestWaitBindingOverlapAcceptsOnlyNewLogon(t *testing.T) {
 	oldRef := sampleRef()
 	newRef := controller.SessionRef{SessionID: oldRef.SessionID + 2, AuthenticationID: "0000000003D481ED", BootIdentifier: oldRef.BootIdentifier}
 	hostname := "lswD2210a001"
-	old := bindingLogin(hostname, "S-1-5-21-1", "user", 0, oldRef)
-	created := bindingLogin(hostname, "S-1-5-21-1", "user", 0, newRef)
+	old := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, oldRef)
+	created := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, newRef)
 	created.ConnectTime = old.ConnectTime + 100
 	before := bindingSnapshot(1, true, old)
 	var statusCalls atomic.Int32
@@ -213,7 +213,7 @@ func TestWaitBindingOverlapAcceptsOnlyNewLogon(t *testing.T) {
 func TestWaitBindingRejectsUnconfirmedOrAmbiguousLogons(t *testing.T) {
 	ref := sampleRef()
 	hostname := "lswD2210a001"
-	matching := bindingLogin(hostname, "S-1-5-21-1", "user", 0, ref)
+	matching := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, ref)
 	cases := []struct {
 		name       string
 		snapshot   controller.SessionSnapshot
@@ -223,17 +223,17 @@ func TestWaitBindingRejectsUnconfirmedOrAmbiguousLogons(t *testing.T) {
 	}{
 		{
 			name:     "wrong client hostname",
-			snapshot: bindingSnapshot(1, true, bindingLogin("other-host", "S-1-5-21-1", "user", 0, ref)),
+			snapshot: bindingSnapshot(1, true, bindingLogin("other-host", "S-1-5-21-1", "user", controller.WTSActive, ref)),
 			wantErr:  "was not bound",
 		},
 		{
 			name:     "wrong user",
-			snapshot: bindingSnapshot(1, true, bindingLogin(hostname, "S-1-5-21-1", "other", 0, ref)),
+			snapshot: bindingSnapshot(1, true, bindingLogin(hostname, "S-1-5-21-1", "other", controller.WTSActive, ref)),
 			wantErr:  "was not bound",
 		},
 		{
 			name:     "disconnected login",
-			snapshot: bindingSnapshot(1, true, bindingLogin(hostname, "S-1-5-21-1", "user", 4, ref)),
+			snapshot: bindingSnapshot(1, true, bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSDisconnected, ref)),
 			wantErr:  "was not bound",
 		},
 		{
@@ -244,7 +244,7 @@ func TestWaitBindingRejectsUnconfirmedOrAmbiguousLogons(t *testing.T) {
 		{
 			name: "multiple active matches",
 			snapshot: bindingSnapshot(1, true, matching,
-				bindingLogin(hostname, "S-1-5-21-1", "user", 0, controller.SessionRef{SessionID: 6, AuthenticationID: "0000000003D481ED", BootIdentifier: ref.BootIdentifier})),
+				bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, controller.SessionRef{SessionID: 6, AuthenticationID: "0000000003D481ED", BootIdentifier: ref.BootIdentifier})),
 			wantErr: "multiple active logons",
 		},
 		{
@@ -327,7 +327,7 @@ func TestWaitBindingStopsWhenOwnedFreeRDPExits(t *testing.T) {
 		if req.Action != "inspect_sessions" {
 			t.Errorf("unexpected action %q", req.Action)
 		}
-		return okReply(map[string]any{"snapshot": bindingSnapshot(1, true, bindingLogin("other-host", "S-1-5-21-1", "user", 0, sampleRef()))})
+		return okReply(map[string]any{"snapshot": bindingSnapshot(1, true, bindingLogin("other-host", "S-1-5-21-1", "user", controller.WTSActive, sampleRef()))})
 	})
 	s := bindingSession(agent)
 	exited := make(chan struct{})
@@ -375,7 +375,7 @@ func TestDispatchRoutesCurrentUserPayloadAndBackendOnlyRequests(t *testing.T) {
 		Kind:      controller.Dispatch,
 		Reference: ref,
 		Request: controller.Request{
-			Action: "run", Mode: controller.ModeRemoteApp, Target: "notepad.exe",
+			Action: "run", UserContext: true, Mode: controller.ModeRemoteApp, Target: "notepad.exe",
 			Params: `"J:\report.docx"`, WorkingDir: `C:\work`,
 		},
 	})
@@ -404,7 +404,7 @@ func TestDispatchExecutesCurrentDesktopPayloadInBoundSession(t *testing.T) {
 			out := s.execute(context.Background(), controller.Operation{
 				Kind:      controller.Dispatch,
 				Reference: ref,
-				Request:   controller.Request{Action: "open", Mode: mode, File: `C:\work\report.txt`},
+				Request:   controller.Request{Action: "open", UserContext: true, Mode: mode, File: `C:\work\report.txt`},
 			})
 			if out.Err != nil || calls.Load() != 1 {
 				t.Fatalf("out=%+v calls=%d", out, calls.Load())
@@ -418,13 +418,13 @@ func TestDispatchConnectRequiresBoundReference(t *testing.T) {
 	out := s.execute(context.Background(), controller.Operation{
 		Kind:      controller.Dispatch,
 		Reference: sampleRef(),
-		Request:   controller.Request{Action: "connect", Mode: controller.ModeDesktop},
+		Request:   controller.Request{Action: "connect", UserContext: true, Mode: controller.ModeDesktop},
 	})
 	response, ok := out.Data.(AgentResponse)
 	if out.Err != nil || !ok || response.Message != "display bound to user logon" || response.SessionRef == nil || *response.SessionRef != sampleRef() {
 		t.Fatal(out)
 	}
-	out = s.execute(context.Background(), controller.Operation{Kind: controller.Dispatch, Request: controller.Request{Action: "connect"}})
+	out = s.execute(context.Background(), controller.Operation{Kind: controller.Dispatch, Request: controller.Request{Action: "connect", UserContext: true}})
 	if out.Err == nil || !strings.Contains(out.Err.Error(), "not bound") {
 		t.Fatal(out)
 	}
@@ -453,7 +453,7 @@ func TestDispatchBatchStopsWithPartialResultsAndFailingIndex(t *testing.T) {
 		Kind:      controller.Dispatch,
 		Reference: ref,
 		Request: controller.Request{
-			Action: "batch", Mode: controller.ModeRemoteApp,
+			Action: "batch", UserContext: true, Mode: controller.ModeRemoteApp,
 			Batch: []controller.Request{
 				{Action: "open", File: "one.txt"},
 				{Action: "open", File: "two.txt"},
@@ -477,6 +477,133 @@ func TestDispatchBatchStopsWithPartialResultsAndFailingIndex(t *testing.T) {
 	}
 }
 
+func TestDispatchUserContextWithoutModeUsesBoundSession(t *testing.T) {
+	ref := sampleRef()
+	agent := jsonAgent(t, func(req agentRequest) any {
+		if req.Action != "open" || req.File != `C:\work\report.txt` {
+			t.Errorf("unexpected request = %+v", req)
+		}
+		if req.SessionRef == nil || *req.SessionRef != ref {
+			t.Errorf("mode-neutral user request did not carry the bound reference: %+v", req.SessionRef)
+		}
+		return okReply(nil)
+	})
+	out := (&Session{agent: agent}).execute(context.Background(), controller.Operation{
+		Kind:      controller.Dispatch,
+		Reference: ref,
+		Request:   controller.Request{Action: "open", UserContext: true, File: `C:\work\report.txt`},
+	})
+	if out.Err != nil {
+		t.Fatal(out.Err)
+	}
+}
+
+func TestOperationTimeoutBudgets(t *testing.T) {
+	if got := operationTimeout(controller.StartDisplay); got != 90*time.Second {
+		t.Fatalf("StartDisplay timeout = %v, want 90s", got)
+	}
+	if got := operationTimeout(controller.InspectSession); got != 30*time.Second {
+		t.Fatalf("InspectSession timeout = %v, want 30s", got)
+	}
+	logoff := operationTimeout(controller.LogoffSession)
+	if logoff != agentTimeout("logoff_session") {
+		t.Fatalf("LogoffSession timeout = %v, agent budget = %v", logoff, agentTimeout("logoff_session"))
+	}
+	if logoff <= 30*time.Second {
+		t.Fatalf("LogoffSession timeout was capped at 30s: %v", logoff)
+	}
+	if got := operationTimeout(controller.QueryVM); got != 15*time.Second {
+		t.Fatalf("default timeout = %v, want 15s", got)
+	}
+}
+
+func assertInspectUsesOperationDeadline(t *testing.T, caller context.Context, opDeadline time.Time) {
+	t.Helper()
+	seen := make(chan time.Time, 1)
+	agent := Agent{AuthToken: func(ctx context.Context) (string, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Error("inspection context has no deadline")
+			seen <- time.Time{}
+			return "", context.DeadlineExceeded
+		}
+		seen <- deadline
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(time.Second):
+			t.Error("inspection context was not bounded by the operation deadline")
+			return "", context.DeadlineExceeded
+		}
+	}}
+	start := time.Now()
+	out := (&Session{agent: agent, sessionUser: "user"}).execute(caller, controller.Operation{
+		Kind:     controller.InspectSession,
+		Deadline: opDeadline,
+	})
+	elapsed := time.Since(start)
+	if out.Err == nil {
+		t.Fatal("inspection with an expired/short operation deadline succeeded")
+	}
+	if elapsed >= 1500*time.Millisecond {
+		t.Fatalf("inspection exceeded its operation deadline: %v", elapsed)
+	}
+	var got time.Time
+	select {
+	case got = <-seen:
+	case <-time.After(time.Second):
+		t.Fatal("inspection provider was not called")
+	}
+	want := opDeadline
+	if callerDeadline, ok := caller.Deadline(); ok && callerDeadline.Before(want) {
+		want = callerDeadline
+	}
+	if got.After(want.Add(20 * time.Millisecond)) {
+		t.Fatalf("inspection deadline = %v, want no later than %v", got, want)
+	}
+}
+
+func TestInspectSessionOperationDeadlineCapsInspection(t *testing.T) {
+	t.Run("expired", func(t *testing.T) {
+		assertInspectUsesOperationDeadline(t, context.Background(), time.Now().Add(-time.Second))
+	})
+	t.Run("short", func(t *testing.T) {
+		assertInspectUsesOperationDeadline(t, context.Background(), time.Now().Add(50*time.Millisecond))
+	})
+	t.Run("caller shorter", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		assertInspectUsesOperationDeadline(t, ctx, time.Now().Add(5*time.Second))
+	})
+}
+
+func TestLogoffOperationHonorsShorterCallerContext(t *testing.T) {
+	agent := fakeAgent(t, func(conn net.Conn) {
+		var req agentRequest
+		if err := json.NewDecoder(conn).Decode(&req); err != nil {
+			t.Error(err)
+			return
+		}
+		if req.Action != "logoff_session" {
+			t.Errorf("request action = %q", req.Action)
+		}
+		_, _ = io.Copy(io.Discard, conn)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	out := (&Session{agent: agent, sessionUser: "user"}).execute(ctx, controller.Operation{
+		Kind:      controller.LogoffSession,
+		Reference: sampleRef(),
+	})
+	if out.Err == nil {
+		t.Fatal("logoff without a response succeeded")
+	}
+	if elapsed := time.Since(start); elapsed >= 2*time.Second {
+		t.Fatalf("caller deadline did not cap logoff wait: %v", elapsed)
+	}
+}
+
 func startDisplaySession(t *testing.T, agent Agent) (*Session, context.Context, context.CancelFunc) {
 	t.Helper()
 	t.Setenv("RDP_TEST_CHILD", "1")
@@ -497,7 +624,7 @@ func startDisplaySession(t *testing.T, agent Agent) (*Session, context.Context, 
 
 func TestStartDisplayBindsOnlyAfterWorkerConfirmation(t *testing.T) {
 	ref := sampleRef()
-	login := bindingLogin("lswD2210a001", "S-1-5-21-1", "user", 0, ref)
+	login := bindingLogin("lswD2210a001", "S-1-5-21-1", "user", controller.WTSActive, ref)
 	var inspects atomic.Int32
 	agent := jsonAgent(t, func(req agentRequest) any {
 		switch req.Action {
@@ -517,7 +644,7 @@ func TestStartDisplayBindsOnlyAfterWorkerConfirmation(t *testing.T) {
 	})
 	s, ctx, cancel := startDisplaySession(t, agent)
 	defer cancel()
-	out := s.execute(ctx, controller.Operation{Kind: controller.StartDisplay, ID: 7, Request: controller.Request{Action: "connect", Mode: controller.ModeRemoteApp}})
+	out := s.execute(ctx, controller.Operation{Kind: controller.StartDisplay, ID: 7, Request: controller.Request{Action: "connect", UserContext: true, Mode: controller.ModeRemoteApp}})
 	if out.Err != nil || out.Binding == nil || out.Binding.Reference != ref || out.Sessions == nil || !out.Sessions.Fresh {
 		t.Fatal(out)
 	}
@@ -536,8 +663,8 @@ func TestStartDisplayUsesPreSpawnBaselineToIgnoreLingeringLogon(t *testing.T) {
 	oldRef := sampleRef()
 	newRef := controller.SessionRef{SessionID: oldRef.SessionID + 2, AuthenticationID: "0000000003D481ED", BootIdentifier: oldRef.BootIdentifier}
 	hostname := "lswD2210a001"
-	old := bindingLogin(hostname, "S-1-5-21-1", "user", 0, oldRef)
-	created := bindingLogin(hostname, "S-1-5-21-1", "user", 0, newRef)
+	old := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, oldRef)
+	created := bindingLogin(hostname, "S-1-5-21-1", "user", controller.WTSActive, newRef)
 	created.ConnectTime = old.ConnectTime + 100
 	var inspects atomic.Int32
 	agent := jsonAgent(t, func(req agentRequest) any {
@@ -561,7 +688,7 @@ func TestStartDisplayUsesPreSpawnBaselineToIgnoreLingeringLogon(t *testing.T) {
 	})
 	s, ctx, cancel := startDisplaySession(t, agent)
 	defer cancel()
-	out := s.execute(ctx, controller.Operation{Kind: controller.StartDisplay, ID: 9, Request: controller.Request{Action: "connect", Mode: controller.ModeRemoteApp}})
+	out := s.execute(ctx, controller.Operation{Kind: controller.StartDisplay, ID: 9, Request: controller.Request{Action: "connect", UserContext: true, Mode: controller.ModeRemoteApp}})
 	if out.Err != nil || out.Binding == nil || out.Binding.Reference != newRef {
 		t.Fatalf("out=%+v", out)
 	}
@@ -579,13 +706,13 @@ func TestStartDisplayCleansUpWhenBindingFails(t *testing.T) {
 		if inspects.Add(1) == 1 {
 			return okReply(map[string]any{"snapshot": bindingSnapshot(1, true)})
 		}
-		return okReply(map[string]any{"snapshot": bindingSnapshot(2, true, bindingLogin("other-host", "S-1-5-21-1", "user", 0, sampleRef()))})
+		return okReply(map[string]any{"snapshot": bindingSnapshot(2, true, bindingLogin("other-host", "S-1-5-21-1", "user", controller.WTSActive, sampleRef()))})
 	})
 	s, ctx, cancel := startDisplaySession(t, agent)
 	defer cancel()
 	ctx, cancelShort := context.WithTimeout(ctx, 400*time.Millisecond)
 	defer cancelShort()
-	out := s.execute(ctx, controller.Operation{Kind: controller.StartDisplay, ID: 8, Request: controller.Request{Action: "connect", Mode: controller.ModeRemoteApp}})
+	out := s.execute(ctx, controller.Operation{Kind: controller.StartDisplay, ID: 8, Request: controller.Request{Action: "connect", UserContext: true, Mode: controller.ModeRemoteApp}})
 	if out.Err == nil || !strings.Contains(out.Err.Error(), "not bound") {
 		t.Fatal(out)
 	}

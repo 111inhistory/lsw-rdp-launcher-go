@@ -38,7 +38,7 @@ func inspectAndLogoff(t *testing.T, m *machine, binding Login, now time.Time) *O
 		t.Fatalf("idle session inspection had source %s", inspect.Source)
 	}
 	disconnected := binding
-	disconnected.State = 4 // WTSDisconnected, the retained logon after display exit.
+	disconnected.State = WTSDisconnected
 	m.done(inspect.ID, Outcome{Sessions: snapshotAt(now, disconnected)}, now)
 	logoff := expectOp(t, m, now, LogoffSession)
 	if logoff.Source != SourceIdle || logoff.Reference != binding.Reference {
@@ -132,7 +132,7 @@ func TestLockBlocksAutomaticLogoffAndReclaim(t *testing.T) {
 		t.Fatal(inspect)
 	}
 	login := *m.state.Binding
-	login.State = 4
+	login.State = WTSDisconnected
 	m.done(inspect.ID, Outcome{Sessions: snapshotAt(epoch.Add(3*time.Hour), login)}, epoch.Add(3*time.Hour))
 	logoff := expectOp(t, m, epoch.Add(3*time.Hour), LogoffSession)
 	m.done(logoff.ID, Outcome{}, epoch.Add(3*time.Hour))
@@ -148,7 +148,7 @@ func TestIdleLogoffSkipsMissingOrActiveBoundLogin(t *testing.T) {
 		mutate func(*Login)
 	}{
 		{"missing", func(l *Login) { l.Reference.SessionID = 9 }},
-		{"active elsewhere", func(l *Login) { l.State = 0 }},
+		{"active elsewhere", func(l *Login) { l.State = WTSActive }},
 		{"different sid", func(l *Login) { l.SID = "S-1-5-21-999" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -158,7 +158,7 @@ func TestIdleLogoffSkipsMissingOrActiveBoundLogin(t *testing.T) {
 			at := autoDisconnect(t, m, epoch)
 			inspect := expectOp(t, m, at, InspectSession)
 			login := binding
-			login.State = 4
+			login.State = WTSDisconnected
 			tc.mutate(&login)
 			m.done(inspect.ID, Outcome{Sessions: snapshotAt(at, login)}, at)
 			expectIdle(t, m, at)
@@ -224,7 +224,7 @@ func TestDispatchRejectsStaleOrMismatchedBinding(t *testing.T) {
 			return activitySnapshot(login)
 		}},
 		{"disconnected login", func(login Login) *SessionSnapshot {
-			login.State = 4
+			login.State = WTSDisconnected
 			return activitySnapshot(login)
 		}},
 	} {

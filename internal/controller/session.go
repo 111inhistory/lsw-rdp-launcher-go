@@ -5,6 +5,12 @@ import (
 	"time"
 )
 
+// WTS state values are part of the Windows wire protocol.
+const (
+	WTSActive       = 0
+	WTSDisconnected = 4
+)
+
 // A logon identity survives reconnects but not a new logon or kernel boot.
 type SessionRef struct {
 	SessionID        uint32 `json:"session_id"`
@@ -45,15 +51,24 @@ func (r Request) Validate() error {
 	if r.Mode != "" && r.Mode != ModeDesktop && r.Mode != ModeRemoteApp {
 		return fmt.Errorf("invalid connection mode %q", r.Mode)
 	}
+	if r.Mode != "" && !r.UserContext {
+		return fmt.Errorf("a display mode requires user context")
+	}
+	if r.Action == "connect" && (r.Mode == "" || !r.UserContext) {
+		return fmt.Errorf("connect requires a display mode and user context")
+	}
+	if r.Choice != "" && !r.UserContext {
+		return fmt.Errorf("a conflict action requires user context")
+	}
 	if r.Choice != "" && r.Choice != SwitchCurrent && r.Choice != SwitchKeep && r.Choice != SwitchLogoff && r.Choice != SwitchCancel {
 		return fmt.Errorf("invalid conflict action %q", r.Choice)
 	}
 	if r.Action == "batch" {
 		if len(r.Batch) == 0 || !r.NeedsUser() {
-			return fmt.Errorf("a user batch requires commands and a connection mode")
+			return fmt.Errorf("a user batch requires commands and user context")
 		}
 		for _, command := range r.Batch {
-			if command.Action == "" || command.Action == "batch" || command.Action == "connect" || len(command.Batch) > 0 || command.Mode != "" || command.Choice != "" || command.Confirm != nil {
+			if command.Action == "" || command.Action == "batch" || command.Action == "connect" || len(command.Batch) > 0 || command.UserContext || command.Mode != "" || command.Choice != "" || command.Confirm != nil {
 				return fmt.Errorf("batch items must contain business payload only")
 			}
 		}
@@ -83,7 +98,7 @@ func (m *machine) boundReady() bool {
 		return false
 	}
 	login, ok := m.state.Sessions.Find(m.state.Binding.Reference)
-	return ok && login.State == 0 && login.SID == m.state.Binding.SID && login.ClientName == m.state.Binding.ClientName && login.ConnectTime == m.state.Binding.ConnectTime
+	return ok && login.State == WTSActive && login.SID == m.state.Binding.SID && login.ClientName == m.state.Binding.ClientName && login.ConnectTime == m.state.Binding.ConnectTime
 }
 
 func (s SessionSnapshot) Find(ref SessionRef) (Login, bool) {

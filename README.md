@@ -23,10 +23,10 @@
 
 ### 生命周期、锁定与协议升级
 
-- **空闲超时与注销**：新配置 `lifecycle.idle_logoff_timeout`（单位秒，**默认 -1 表示禁用**），与日常空闲仅断开连接的现状一致。设置为 `0` 表示显示断开后立即尝试注销；启用时为非负值，与挂起计时起点一致（显示断开 `!Display` 后起算）。挂起启用时要求 `0 <= idle_logoff_timeout <= vm_suspend_timeout`（挂起禁用时不设此上界）。注销不依赖是否启用自动断开，手动关闭桌面或 RemoteApp 连接同样适用。启用注销时，内存回收移至确认注销完成后立即执行。
+- **空闲超时与注销**：新配置 `lifecycle.idle_logoff_timeout`（单位秒，**默认 -1 表示禁用**），与日常空闲仅断开连接的现状一致。设置为 `0` 表示显示断开后立即尝试注销；启用时为非负值，与挂起计时起点一致（显示断开 `!Display` 后起算）。挂起启用时要求 `0 <= idle_logoff_timeout <= vm_suspend_timeout`（挂起禁用时不设此上界）。注销不依赖是否启用自动断开，手动关闭桌面或 RemoteApp 连接同样适用。启用注销时，内存回收移至确认注销完成后立即执行。注销倒计时完全不受内存压力（pressure）、扩容中（Growing）或未知状态（unknown memory）影响；这些状态仅作为安全内存回收与 VM 挂起的门控，不重置注销。确认注销后待回收的内存会在条件安全时再执行；启用注销时，在待处理注销未决期间，绝不执行挂起前的主动内存缩容。显示断开后若 WTS 仍呈 Active（过渡期），控制器废弃本地缓存，以 500ms 间隔复核至多 30 秒；若确认为外部活动则跳过注销并保留；过渡期未决前不自旋、不抢先挂起。宿主外层注销超时预算为 35 秒，对应 Windows Agent 端 30 秒预算。
 - **删除空会话自动注销**：彻底移除旧切换流程中因窗口和托盘计数为零而触发的 `require_empty` 自动注销逻辑；空登录默认保留，注销操作必须由用户在确认流程中明确授权。
 - **统一 lock 语义**：lock 统一禁止所有自动破坏性操作（自动断开连接、自动注销图形登录、主动内存缩容及自动挂起 VM），但显式用户请求仍正常执行。lock 仅驻留在控制器服务内存中，不持久化、不创建锁文件；VM 关机清除 lock，服务重启同样恢复为 unlocked。
-- **协议升级与强校验**：宿主与 Windows Agent 通信采用协议版本 2（`protocol: 2`）。新旧协议版本不匹配时立即拒绝并提示配套升级，不静默忽略新字段，不进行旧端点兜底兼容。更新采取手动配套升级。
+- **协议升级与客户端主机名迁移**：宿主与 Windows Agent 通信采用协议版本 2（`protocol: 2`）。新旧协议版本不匹配时立即拒绝并提示配套升级，不静默忽略新字段，不进行旧端点兜底兼容。更新采取手动配套升级。新版 `[freerdp].client_hostname` 默认值为 `"rdp-launcher"`；旧版没有显式设置该参数，实际名称由旧 FreeRDP 及其参数决定，不能直接假定等于 `os.Hostname()`。若升级前 Windows 留有旧断开登录，换名可能导致会话复用失败（本机换名实验记录了 `0x80004005`）。升级前由用户保存工作并通过 Windows 正常注销旧登录，或将 `client_hostname` 配成旧连接实际生效的名称；不要为了迁移自动调用已知有故障的旧注销 RPC（该升级路径真机验收目前标记为 pending；业务 VM 关机状态下不进行自动探测）。
 
 后台状态使用长连接：首次快照，之后仅推送状态变化。没有应用层心跳和固定读取超时。VM Running 时重新订阅，暂停/关闭时结束旧订阅。libvirt、内存、Niri 与后台来源断线后各自退避重连；订阅被确认后重新查询 VM/内存或取得新快照，断线期间观测视为失效。VM 命令已接受但确认来源丢失时立即释放控制槽，并向关联调用者报告结果未知；补查失败则重建该次来源，按相同退避继续恢复，不等待新 CLI 请求。恢复只覆盖观测，不自动重放已发出且结果未知的 run/open 等业务请求。SSH 只区分零/非零/Unknown，60 秒检查为 Windows 侧的低频兜底。
 
@@ -72,7 +72,7 @@ cp -n config.example.toml ~/.config/rdp-launcher-go/config.toml
 - 宿主从 Keyring 读取 token：服务名默认是 `<server.service>-agent`（默认 `rdp-bridge-agent`），用户名固定为 `agent`，与 RDP 密码条目分开。可用 `[server].agent_service` 覆盖。
 - Windows 后台端只用 `--auth-token-file PATH` 指向 token 文件，启动时读取一次；token 本身不进入 argv 或日志。后台服务必须显式带该参数。
 - 用户会话动作（启动应用、打开文件、枚举应用、映射盘）由后台服务在收到请求后，核对配置的账户 SID 与 SessionRef，通过本机受限 IPC 路由至按需启动的用户会话 worker 执行。RemoteApp shell 仅作为连接保活运行（`remoteapp-shell` 角色），不监听 TCP。
-- FreeRDP 客户端主机名通过 `[freerdp].client_hostname` 配置（默认 `rdp-launcher`，<=15 字符 ASCII），保持 FreeRDP 客户端 NetBIOS 名称稳定，以保证会话可靠复用与重连关联。
+- FreeRDP 客户端主机名通过 `[freerdp].client_hostname` 配置（默认 `rdp-launcher`，<=15 字符 ASCII），保持客户端名称稳定以支持复用与重连关联，实际登录仍须按新鲜快照完成绑定，不保证所有 Windows 策略下都能复用。
 - 非 loopback 监听缺少 token 文件时直接拒绝启动，不会静默退回无鉴权。仅 loopback 且未提供 token 文件时保留**显式 local-only 模式**，只适合本机测试。
 - 请求 JSON 使用顶层 `token` 字段；校验失败返回 `authentication required`。当前主程序会以固定动作名记录请求，不再打印原始请求内容。
 
@@ -103,6 +103,10 @@ rdp-launcher remoteapp   # 连接 RemoteApp（必要时提示切换）。
 ```
 
 桌面模式与 RemoteApp 共用一个 FreeRDP 客户端和 Keyring。同一控制器单所有者只管理一个 FreeRDP 实例，按 Pro 的单活跃交互式会话模型处理。业务启动（`run`/`open`）与显式连接（`desktop`/`remoteapp`）共用同一个 FIFO 执行流程，保留原始 payload。
+
+请求将**执行环境需求（`UserContext bool`）与目标显示模式（可选 `Mode`）正交分离**：
+- `apps`、`sync-apps`、`mounts`：仅要求用户执行上下文（`UserContext=true`），`Mode` 留空。若当前已有活动显示连接（无论 RD 桌面还是 RemoteApp），直接复用当前已绑定连接的用户 worker 执行，**不弹窗、不切换**；若当前无连接（`!Display`），则默认启动 RemoteApp 连接以建立会话；**严禁猜测并拾取后台断开的旧登录（Disconnected login）**，避免不同登录下不同的 `net use`、`\\tsclient` 网络映射盘或环境上下文产生混淆。
+- `run`、`open`：仍然是具有特定模式倾向的操作（默认 RemoteApp）。若当前已连接桌面（Desktop），**即使桌面为空，也先等待明确选择（包含在当前桌面执行 `current`、保留、注销或取消；已传入 `--on-conflict` 时不再弹窗）**，把是否在全屏桌面内直接拉起应用的选择权交还用户。
 
 当目标模式与当前状态存在冲突或需要用户选择时，控制器在同一个持续请求 IPC 连接中向 CLI 发送确认提示，提供互斥的四个动作选项：
 1. **在当前桌面执行**（`current`）：直接在已绑定的当前桌面登录中执行，不停止 FreeRDP，不注销。

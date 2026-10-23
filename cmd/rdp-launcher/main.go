@@ -269,7 +269,7 @@ socket is usable, otherwise on a terminal; --on-conflict decides without one.`)
 		if command == "desktop" {
 			mode = controller.ModeDesktop
 		}
-		data, err := remote(controller.Request{Action: "connect", Mode: mode})
+		data, err := remote(controller.Request{Action: "connect", UserContext: true, Mode: mode})
 		if err != nil {
 			return err
 		}
@@ -280,10 +280,10 @@ socket is usable, otherwise on a terminal; --on-conflict decides without one.`)
 		}
 		request := controller.Request{Action: "ping"}
 		if command == "apps" || command == "sync-apps" {
-			request = controller.Request{Action: "list_apps", Mode: controller.ModeRemoteApp, WithIcons: command == "sync-apps"}
+			request = controller.Request{Action: "list_apps", UserContext: true, WithIcons: command == "sync-apps"}
 		}
 		if command == "mounts" {
-			request = controller.Request{Action: "get_mapped_drives", Mode: controller.ModeRemoteApp}
+			request = controller.Request{Action: "get_mapped_drives", UserContext: true}
 		}
 		data, err := remote(request)
 		if err != nil {
@@ -373,7 +373,7 @@ socket is usable, otherwise on a terminal; --on-conflict decides without one.`)
 		if *directory == "" {
 			*directory = app.WorkingDir
 		}
-		data, err := remote(controller.Request{Action: "run", Mode: controller.ModeRemoteApp, Target: app.Target, Params: arguments, WorkingDir: *directory})
+		data, err := remote(controller.Request{Action: "run", UserContext: true, Mode: controller.ModeRemoteApp, Target: app.Target, Params: arguments, WorkingDir: *directory})
 		if err != nil {
 			return err
 		}
@@ -423,8 +423,9 @@ socket is usable, otherwise on a terminal; --on-conflict decides without one.`)
 		// carries the only mode and choice; items keep their original business payload.
 		request := batch[0]
 		if len(batch) > 1 {
-			request = controller.Request{Action: "batch", Mode: controller.ModeRemoteApp, Batch: batch}
+			request = controller.Request{Action: "batch", UserContext: true, Mode: controller.ModeRemoteApp, Batch: batch}
 		} else {
+			request.UserContext = true
 			request.Mode = controller.ModeRemoteApp
 		}
 		data, err := remote(request)

@@ -103,7 +103,7 @@ func sampleSnapshot(revision uint64, fresh bool) controller.SessionSnapshot {
 			SID:           "S-1-5-21-1",
 			User:          "user",
 			Domain:        "MACHINE",
-			State:         0,
+			State:         controller.WTSActive,
 			ClientName:    "lswD2210a001",
 			ClientAddress: "192.0.2.10",
 			LogonTime:     100,
@@ -206,7 +206,7 @@ func TestAgentCallInSessionCarriesExactReference(t *testing.T) {
 		}
 		_ = json.NewEncoder(conn).Encode(okReply(nil))
 	})
-	if _, err := a.CallInSession(context.Background(), controller.Request{Action: "run", Target: `C:\Program Files\app.exe`, Params: `"J:\some file.docx"`, WorkingDir: `C:\work`}, ref); err != nil {
+	if _, err := a.CallInSession(context.Background(), controller.Request{Action: "run", UserContext: true, Target: `C:\Program Files\app.exe`, Params: `"J:\some file.docx"`, WorkingDir: `C:\work`}, ref); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -220,13 +220,13 @@ func TestAgentMutatingTransportFailureIsUnknownAndNotRetried(t *testing.T) {
 		{
 			action: "run",
 			call: func(a Agent) (AgentResponse, error) {
-				return a.CallInSession(context.Background(), controller.Request{Action: "run", Target: "notepad.exe"}, ref)
+				return a.CallInSession(context.Background(), controller.Request{Action: "run", UserContext: true, Target: "notepad.exe"}, ref)
 			},
 		},
 		{
 			action: "open",
 			call: func(a Agent) (AgentResponse, error) {
-				return a.CallInSession(context.Background(), controller.Request{Action: "open", File: `C:\work\file.txt`}, ref)
+				return a.CallInSession(context.Background(), controller.Request{Action: "open", UserContext: true, File: `C:\work\file.txt`}, ref)
 			},
 		},
 		{
@@ -294,7 +294,7 @@ func TestAgentDialFailureIsNotMarkedSubmitted(t *testing.T) {
 	endpoint := listener.Addr().String()
 	listener.Close()
 	a := Agent{Endpoint: endpoint}
-	_, err = a.CallInSession(context.Background(), controller.Request{Action: "run", Target: "notepad.exe"}, sampleRef())
+	_, err = a.CallInSession(context.Background(), controller.Request{Action: "run", UserContext: true, Target: "notepad.exe"}, sampleRef())
 	if err == nil {
 		t.Fatal("dial to a closed listener succeeded")
 	}

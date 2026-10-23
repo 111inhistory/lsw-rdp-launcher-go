@@ -17,10 +17,15 @@ func TestIPCPassesRequestsAndRejectsRemovedSwitchAction(t *testing.T) {
 	defer cancel()
 	clientCtx, stopClient := context.WithCancel(ctx)
 	defer stopClient()
+	ref := controller.SessionRef{SessionID: 5, AuthenticationID: "AUTH", BootIdentifier: "BOOT"}
+	login := controller.Login{Reference: ref, SID: "S-1", User: "user", Domain: "DOMAIN", State: 0, ClientName: "rdp-launcher"}
+	bindingSnapshot := controller.SessionSnapshot{Revision: 1, Fresh: true, Sessions: []controller.Login{login}, ObservedAt: time.Now()}
 	c := controller.New(controller.Options{}, func(ctx context.Context, op controller.Operation) controller.Outcome {
 		switch op.Kind {
 		case controller.QueryVM:
 			return controller.Outcome{VM: controller.VMRunning}
+		case controller.StartDisplay:
+			return controller.Outcome{Binding: &login, Sessions: &bindingSnapshot}
 		case controller.Dispatch:
 			return controller.Outcome{Data: op.Request}
 		}
@@ -56,19 +61,19 @@ func TestIPCPassesRequestsAndRejectsRemovedSwitchAction(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unknown host action") {
 		t.Fatal("removed switch action was accepted", err)
 	}
-	want := controller.Request{Action: "run", Target: `C:\Windows\notepad.exe`, Params: "/x", WorkingDir: `C:\Windows`, File: `J:\notes.txt`}
+	want := controller.Request{Action: "run", UserContext: true, Mode: controller.ModeRemoteApp, Target: `C:\Windows\notepad.exe`, Params: "/x", WorkingDir: `C:\Windows`, File: `J:\notes.txt`}
 	data, err := Call(ctx, socket, Request{Action: "request", Request: want})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var got controller.Request
-	if err = json.Unmarshal(data, &got); err != nil || got.Action != want.Action || got.Mode != want.Mode || got.Target != want.Target || got.Params != want.Params || got.WorkingDir != want.WorkingDir || got.File != want.File {
+	if err = json.Unmarshal(data, &got); err != nil || got.Action != want.Action || got.UserContext != want.UserContext || got.Mode != want.Mode || got.Target != want.Target || got.Params != want.Params || got.WorkingDir != want.WorkingDir || got.File != want.File {
 		t.Fatal(string(data), err)
 	}
 }
 
 func TestRequestWireFieldsHaveBusinessTagsOnly(t *testing.T) {
-	raw, err := json.Marshal(controller.Request{Action: "open", Mode: controller.ModeDesktop, Choice: controller.SwitchKeep, File: `J:\a.txt`, Batch: []controller.Request{{Action: "open", File: `J:\a.txt`}}})
+	raw, err := json.Marshal(controller.Request{Action: "open", UserContext: true, Mode: controller.ModeDesktop, Choice: controller.SwitchKeep, File: `J:\a.txt`, Batch: []controller.Request{{Action: "open", File: `J:\a.txt`}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +81,7 @@ func TestRequestWireFieldsHaveBusinessTagsOnly(t *testing.T) {
 	if err = json.Unmarshal(raw, &fields); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"action", "mode", "choice", "file", "batch"} {
+	for _, name := range []string{"action", "user_context", "mode", "choice", "file", "batch"} {
 		if _, ok := fields[name]; !ok {
 			t.Fatalf("missing %q in %s", name, raw)
 		}

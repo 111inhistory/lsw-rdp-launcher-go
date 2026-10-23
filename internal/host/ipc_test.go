@@ -20,9 +20,15 @@ func TestIPCSharedControllerCancellationAndShutdown(t *testing.T) {
 	root, shutdown := context.WithCancel(ctx)
 	defer shutdown()
 	started, canceled := make(chan struct{}), make(chan struct{})
+	ref := controller.SessionRef{SessionID: 7, AuthenticationID: "AUTH", BootIdentifier: "BOOT"}
+	login := controller.Login{Reference: ref, SID: "S-1", User: "user", Domain: "DOMAIN", State: 0, ClientName: "rdp-launcher"}
+	bindingSnapshot := controller.SessionSnapshot{Revision: 1, Fresh: true, Sessions: []controller.Login{login}, ObservedAt: time.Now()}
 	c := controller.New(controller.Options{}, func(ctx context.Context, op controller.Operation) controller.Outcome {
 		if op.Kind == controller.QueryVM {
 			return controller.Outcome{VM: controller.VMRunning}
+		}
+		if op.Kind == controller.StartDisplay {
+			return controller.Outcome{Binding: &login, Sessions: &bindingSnapshot}
 		}
 		if op.Kind == controller.Dispatch {
 			if op.Request.Action == "blocked" {
@@ -113,7 +119,7 @@ func TestIPCSharedControllerCancellationAndShutdown(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("disconnected caller's operation was not canceled")
 	}
-	want := controller.Request{Action: "get_mapped_drives"}
+	want := controller.Request{Action: "get_mapped_drives", UserContext: true}
 	data, err = Call(ctx, socket, Request{Action: "request", Request: want})
 	if err != nil {
 		t.Fatal(err)
@@ -414,7 +420,7 @@ func TestIPCResultCarriesPartialBatchDataWithBusinessError(t *testing.T) {
 		}
 		return controller.Outcome{}
 	})
-	batch := controller.Request{Action: "batch", Mode: controller.ModeRemoteApp, Batch: []controller.Request{{Action: "open", File: `J:\a.txt`}, {Action: "open", File: `J:\b.txt`}}}
+	batch := controller.Request{Action: "batch", UserContext: true, Mode: controller.ModeRemoteApp, Batch: []controller.Request{{Action: "open", File: `J:\a.txt`}, {Action: "open", File: `J:\b.txt`}}}
 	data, err := CallWithConfirm(ctx, socket, Request{Action: "request", Request: batch}, nil)
 	if err == nil || !strings.Contains(err.Error(), "batch stopped") {
 		t.Fatalf("business error lost: data=%s err=%v", data, err)

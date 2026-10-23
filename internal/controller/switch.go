@@ -130,15 +130,15 @@ func (m *machine) switchDone(op *Operation, out Outcome) bool {
 			return true
 		}
 		login, ok := out.Sessions.Find(m.state.Binding.Reference)
-		if !ok || login.State != 0 || login.SID != m.state.Binding.SID {
+		if !ok || login.State != WTSActive || login.SID != m.state.Binding.SID {
 			m.finish(s.job, Result{Err: fmt.Errorf("bound logon changed; connection kept")})
 			return true
 		}
 		m.sessions(*out.Sessions)
 		s.observed, s.activity = login, login.Activity()
 		s.phase = switchConfirm
-		if s.job.request.Choice == "" && s.activity.Empty() {
-			// Empty UI observations never authorize logoff.
+		if s.job.request.Choice == "" && s.activity.Empty() && s.mode != ModeDesktop {
+			// Empty UI never authorizes logoff or silently abandons a desktop.
 			s.decision, s.phase = SwitchKeep, switchDisconnect
 		}
 	case ConfirmSwitch:

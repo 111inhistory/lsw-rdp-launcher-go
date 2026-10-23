@@ -390,7 +390,7 @@ func (m *machine) memoryDeadline() time.Time {
 	if mem.Awaiting && mem.TargetBytes > 0 && mem.Growing && mem.GuestKnown && m.state.BackendReady && mem.LastError == nil && mem.WindowPrepared && mem.pokes < memoryDrainLimit && mem.Device.ActualBytes > mem.lastPoked {
 		at = earlier(at, mem.pokeAt)
 	}
-	if m.opts.Memory != nil && mem.LastError == nil && mem.DeviceKnown && mem.GuestKnown && !mem.Growing &&
+	if (m.opts.IdleLogoff < 0 || m.idleLogoffDone) && m.opts.Memory != nil && mem.LastError == nil && mem.DeviceKnown && mem.GuestKnown && !mem.Growing &&
 		!m.state.SuspendDeadline.IsZero() && mem.reclaimedFor != m.state.SuspendDeadline {
 		at = earlier(at, m.state.SuspendDeadline.Add(-MemoryReclaimLead))
 	}

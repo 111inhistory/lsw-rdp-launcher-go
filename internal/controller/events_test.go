@@ -91,7 +91,7 @@ func TestLifecycleQueuedBeforeStartupIsAppliedFirst(t *testing.T) {
 func TestRealDeadlineDisconnectsThenPausesWithoutPolling(t *testing.T) {
 	h := newHarness(t, Options{IdleDisconnect: 10 * time.Millisecond, VMSuspend: 10 * time.Millisecond, IdleLogoff: -time.Second})
 	h.notify(t, BackendObserved{true, SSHZero})
-	result := h.request(h.ctx, Request{Action: "run", Mode: ModeRemoteApp})
+	result := h.request(h.ctx, Request{Action: "run", Mode: ModeRemoteApp, UserContext: true})
 	h.expect(t, StartDisplay)
 	login := bindingLogin(2)
 	snapshot := sessionSnapshot(login)

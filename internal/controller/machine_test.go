@@ -19,7 +19,7 @@ func testMachine() *machine {
 // addJob uses an empty mode for background work. User requests carry the
 // connection mode that selects RemoteApp or the desktop.
 func addJob(m *machine, action, mode string) *job {
-	j := &job{ctx: context.Background(), request: Request{Action: action, Mode: mode}, reply: make(chan Result, 1)}
+	j := &job{ctx: context.Background(), request: Request{Action: action, Mode: mode, UserContext: mode != ""}, reply: make(chan Result, 1)}
 	m.enqueue(j)
 	return j
 }
@@ -36,7 +36,7 @@ func bindingLogin(id uint32) Login {
 		SID:           "S-1-5-21-100",
 		User:          "user",
 		Domain:        "DOMAIN",
-		State:         0,
+		State:         WTSActive,
 		ClientName:    "rdp-launcher",
 		ClientAddress: "10.0.0.2",
 		LogonTime:     1000,
