@@ -42,7 +42,7 @@ go test -race -count=100 ./internal/host \
 
 **警告：实机测试可能改变 VM、内存设备或登录状态。** 只在专用环境中运行，先检查测试源码的目标、权限和副作用。
 
-未设置相关环境变量时，实机测试默认跳过：
+未设置实机测试环境变量时，实机测试默认跳过：
 
 - `RDP_LIVE_BACKGROUND`：已运行的测试后台端点。
 - `RDP_LIVE_TOKEN_FILE`：宿主上的受限测试 token 文件，不把 token 值放入 argv。

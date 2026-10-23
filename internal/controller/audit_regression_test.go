@@ -211,7 +211,7 @@ func TestOutcomeDataAndErrorAreBothPreserved(t *testing.T) {
 
 // D5: lock blocks a new automatic memory pause, but an already accepted pause
 // and its resume are safety cleanup that must continue. See
-// docs/session-lifecycle-redesign.md §7 "已接受操作的状态确认、必要安全收尾".
+// See docs/architecture.md: lock does not cancel accepted-operation safety cleanup.
 func TestLockBlocksNewPauseButCompletesAcceptedPreparation(t *testing.T) {
 	t.Run("new automatic pause blocked", func(t *testing.T) {
 		m := memoryMachine(t)
