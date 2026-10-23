@@ -51,11 +51,20 @@ func (r Request) Validate() error {
 	if r.Mode != "" && r.Mode != ModeDesktop && r.Mode != ModeRemoteApp {
 		return fmt.Errorf("invalid connection mode %q", r.Mode)
 	}
+	if r.Mode != "" && !r.UserContext {
+		return fmt.Errorf("a display mode requires user context")
+	}
+	if r.Action == "connect" && (r.Mode == "" || !r.UserContext) {
+		return fmt.Errorf("connect requires a display mode and user context")
+	}
+	if r.Choice != "" && !r.UserContext {
+		return fmt.Errorf("a conflict action requires user context")
+	}
 	if r.Choice != "" && r.Choice != SwitchCurrent && r.Choice != SwitchKeep && r.Choice != SwitchLogoff && r.Choice != SwitchCancel {
 		return fmt.Errorf("invalid conflict action %q", r.Choice)
 	}
-	if r.Action == "batch" && len(r.Batch) == 0 {
-		return fmt.Errorf("batch requires commands")
+	if r.Action == "batch" && (len(r.Batch) == 0 || !r.NeedsUser()) {
+		return fmt.Errorf("a user batch requires commands and user context")
 	}
 	return nil
 }

@@ -3,7 +3,9 @@ package host
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -200,21 +202,40 @@ func (c Config) SyncApps(apps []adapter.App, executable, config, socket string) 
 	stagedDesktopTargets = append(stagedDesktopTargets, desktopTarget)
 	stagedDesktopsMap[desktopTarget] = desktopStage
 
+	var published []backupRecord
+
+	// Publish icons
 	for _, target := range stagedIconTargets {
-		if err := os.Rename(stagedIconsMap[target], target); err != nil {
-			return err
+		staged := stagedIconsMap[target]
+		rec, err := publishFile(staged, target)
+		if err != nil {
+			return handlePublishError(err, published)
 		}
+		published = append(published, rec)
 	}
 
+	// Publish desktop entries
 	for _, target := range stagedDesktopTargets {
-		if err := os.Rename(stagedDesktopsMap[target], target); err != nil {
-			return err
+		staged := stagedDesktopsMap[target]
+		rec, err := publishFile(staged, target)
+		if err != nil {
+			return handlePublishError(err, published)
 		}
+		published = append(published, rec)
 	}
 
+	// Publish cache last
 	cacheTarget := filepath.Join(cache, "apps.json")
-	if err := os.Rename(stagedCache, cacheTarget); err != nil {
-		return err
+	rec, err := publishFile(stagedCache, cacheTarget)
+	if err != nil {
+		return handlePublishError(err, published)
+	}
+	published = append(published, rec)
+
+	for _, item := range published {
+		if item.backup != "" {
+			_ = os.Remove(item.backup)
+		}
 	}
 
 	oldDesktops, err := filepath.Glob(filepath.Join(dir, "rdp-launcher-go-*.desktop"))
@@ -242,6 +263,112 @@ func (c Config) SyncApps(apps []adapter.App, executable, config, socket string) 
 	}
 
 	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s is a directory", src)
+	}
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Close()
+}
+
+func createBackup(target string, mode os.FileMode) (string, error) {
+	dir := filepath.Dir(target)
+	base := filepath.Base(target)
+	backup, err := os.CreateTemp(dir, "."+base+"-rollback-*.bak")
+	if err != nil {
+		return "", err
+	}
+	backupName := backup.Name()
+	backup.Close()
+
+	if err := copyFile(target, backupName); err != nil {
+		_ = os.Remove(backupName)
+		return "", err
+	}
+	if err := os.Chmod(backupName, mode.Perm()); err != nil {
+		_ = os.Remove(backupName)
+		return "", err
+	}
+	return backupName, nil
+}
+
+type backupRecord struct {
+	target string
+	backup string // non-empty if target existed before
+}
+
+func publishFile(staged, target string) (backupRecord, error) {
+	record := backupRecord{target: target}
+
+	if fi, err := os.Lstat(target); err == nil {
+		if fi.IsDir() {
+			return record, fmt.Errorf("target %s is a directory", target)
+		}
+		backup, err := createBackup(target, fi.Mode())
+		if err != nil {
+			return record, fmt.Errorf("backup %s: %w", target, err)
+		}
+		record.backup = backup
+	} else if !os.IsNotExist(err) {
+		return record, fmt.Errorf("stat %s: %w", target, err)
+	}
+
+	if err := os.Rename(staged, target); err != nil {
+		if record.backup != "" {
+			_ = os.Remove(record.backup)
+		}
+		return record, fmt.Errorf("publish %s: %w", target, err)
+	}
+	return record, nil
+}
+
+func rollback(published []backupRecord) error {
+	var errs []error
+	for i := len(published) - 1; i >= 0; i-- {
+		item := published[i]
+		if item.backup != "" {
+			if err := os.Rename(item.backup, item.target); err != nil {
+				if copyErr := copyFile(item.backup, item.target); copyErr != nil {
+					errs = append(errs, fmt.Errorf("restore %s: %w", item.target, err))
+				} else {
+					_ = os.Remove(item.backup)
+				}
+			}
+		} else {
+			if err := os.Remove(item.target); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, fmt.Errorf("remove %s: %w", item.target, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func handlePublishError(pubErr error, published []backupRecord) error {
+	if rbErr := rollback(published); rbErr != nil {
+		return errors.Join(pubErr, fmt.Errorf("rollback failed: %w", rbErr))
+	}
+	return pubErr
 }
 
 func stageCache(cacheDir string, apps []adapter.App) (string, error) {

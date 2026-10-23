@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -9,6 +10,41 @@ func addUserJob(m *machine, action, mode string) *job {
 	j := &job{ctx: context.Background(), request: Request{Action: action, Mode: mode, UserContext: true}, reply: make(chan Result, 1)}
 	m.enqueue(j)
 	return j
+}
+
+func TestDisplayModeBatchAndConflictRequireUserContext(t *testing.T) {
+	if err := (Request{Action: "ping"}).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range []Request{
+		{Action: "list_apps", Mode: ModeRemoteApp},
+		{Action: "list_apps", Mode: ModeDesktop},
+		{Action: "connect", Mode: ModeDesktop},
+		{Action: "run", Target: "app", Choice: SwitchKeep},
+		{Action: "batch", Batch: []Request{{Action: "open", File: `C:\a.txt`}}},
+	} {
+		if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "user context") {
+			t.Fatalf("request without user context was accepted: %+v (%v)", request, err)
+		}
+	}
+	if err := (Request{Action: "batch", UserContext: true, Mode: ModeRemoteApp, Batch: []Request{{Action: "open", File: `C:\a.txt`}}}).Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNonUserDispatchNeverCarriesRetainedLogonReference(t *testing.T) {
+	m := testMachine()
+	oldDisplay := displayReady(t, m)
+	m.displayExited(oldDisplay, nil)
+	if m.state.Display || m.state.Binding == nil {
+		t.Fatal("fixture did not retain disconnected binding", m.snapshot())
+	}
+	m.enqueue(&job{ctx: context.Background(), request: Request{Action: "ping"}, reply: make(chan Result, 1)})
+	dispatch := expectOp(t, m, epoch, Dispatch)
+	if dispatch.Reference != (SessionRef{}) {
+		t.Fatalf("background request carried retained logon reference: %+v", dispatch.Reference)
+	}
+	m.done(dispatch.ID, Outcome{}, epoch)
 }
 
 func TestBoundDesktopModeNeutralQueriesDispatchOnExactLoginWithoutConfirmation(t *testing.T) {

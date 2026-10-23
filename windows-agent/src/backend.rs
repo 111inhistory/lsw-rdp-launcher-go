@@ -3,7 +3,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -12,8 +12,8 @@ use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use crate::protocol::{
-    check_protocol, ErrorResponse, HostAction, Snapshot, WorkerRequest, WorkerResponse, PROTOCOL,
-    ROLE_BACKGROUND, ROLE_USER,
+    check_protocol, verify_worker_identity, ErrorResponse, HostAction, Snapshot, WorkerRequest,
+    WorkerResponse, PROTOCOL, ROLE_BACKGROUND, ROLE_USER,
 };
 use crate::{auth, memory, session, ssh, worker};
 
@@ -488,21 +488,14 @@ async fn handle(
                 .await;
             }
             let sid = access.sid.clone();
-            let deadline = Instant::now() + USER_ACTION_WORKER_TIMEOUT;
+            let response_sid = sid.clone();
+            let response_reference = session_ref.clone();
             let result = tokio::task::spawn_blocking(move || {
-                session::verify_reference(&session_ref, &sid)?;
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "session status expired after identity verification",
-                    ));
-                }
                 worker::execute(
-                    session_ref.session_id,
+                    &session_ref,
                     &sid,
                     WorkerRequest::SessionStatus,
-                    remaining,
+                    USER_ACTION_WORKER_TIMEOUT,
                 )
             })
             .await;
@@ -518,6 +511,22 @@ async fn handle(
                             .await
                         }
                     };
+                    if let Err(error) = verify_worker_identity(
+                        &response_reference,
+                        &response_sid,
+                        status.reference.session_id,
+                        &status.sid,
+                        Some(&status.reference.authentication_id),
+                        &status.reference.boot_identifier,
+                    ) {
+                        return send_error(
+                            &mut write,
+                            ErrorResponse::protocol(format!(
+                                "user worker identity does not match the verified session_ref: {error}"
+                            )),
+                        )
+                        .await;
+                    }
                     send(&mut write, &user_status_response(status)).await
                 }
                 Ok(Ok(response)) => {
@@ -590,17 +599,8 @@ async fn handle(
                 .await;
             };
             let sid = access.sid.clone();
-            let deadline = Instant::now() + timeout;
             let result = tokio::task::spawn_blocking(move || {
-                session::verify_reference(&reference, &sid)?;
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "user action expired after identity verification",
-                    ));
-                }
-                worker::execute(reference.session_id, &sid, worker_request, remaining)
+                worker::execute(&reference, &sid, worker_request, timeout)
             })
             .await;
             match result {

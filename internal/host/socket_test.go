@@ -31,11 +31,11 @@ func TestControllerSocketDoesNotRemoveLiveOrUnrelatedPath(t *testing.T) {
 		root := t.TempDir()
 		socket := filepath.Join(root, "controller.sock")
 		if live {
-			_, closeListener, err := listenController(socket)
+			listener, err := net.Listen("unix", socket)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer closeListener()
+			defer listener.Close()
 		} else if err := os.WriteFile(socket, []byte("unrelated file"), 0600); err != nil {
 			t.Fatal(err)
 		}

@@ -287,6 +287,37 @@ pub enum WorkerRequest {
     SessionStatus,
 }
 
+/// Compare the actual identity of an opened user token (or worker status) with
+/// the expected SessionRef and configured SID before using that token handle.
+/// A matching Session ID and SID are not enough: a same-account re-logon
+/// changes the AuthenticationId.
+pub fn verify_worker_identity(
+    expected_reference: &SessionRef,
+    expected_sid: &str,
+    actual_session_id: u32,
+    actual_sid: &str,
+    actual_authentication_id: Option<&str>,
+    actual_boot_identifier: &str,
+) -> Result<(), String> {
+    expected_reference.validate()?;
+    if !same_boot_identifier(&expected_reference.boot_identifier, actual_boot_identifier) {
+        return Err("boot identifier changed; session reference is stale".into());
+    }
+    if expected_reference.session_id != actual_session_id {
+        return Err("user token belongs to a different session".into());
+    }
+    if expected_sid != actual_sid {
+        return Err("target session account SID does not match the configured account".into());
+    }
+    match actual_authentication_id {
+        Some(authentication_id) if authentication_id == expected_reference.authentication_id => {
+            Ok(())
+        }
+        Some(_) => Err("target session logon identity changed; session reference is stale".into()),
+        None => Err("target session logon identity is unavailable".into()),
+    }
+}
+
 impl From<HostAction> for Option<WorkerRequest> {
     fn from(action: HostAction) -> Self {
         match action {
@@ -506,6 +537,78 @@ mod tests {
         assert!(error.message.contains("upgraded together"));
         assert!(check_protocol(&serde_json::json!({"action": "ping", "protocol": 1})).is_err());
         assert!(check_protocol(&serde_json::json!({"action": "ping", "protocol": 2})).is_ok());
+    }
+
+    #[test]
+    fn same_sid_with_different_luid_or_boot_is_rejected() {
+        let expected = reference();
+        let sid = "S-1-5-21-1";
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id,
+            sid,
+            Some(&expected.authentication_id),
+            &expected.boot_identifier,
+        )
+        .is_ok());
+
+        // Same account SID and session ID, but a new logon LUID reused the ID.
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id,
+            sid,
+            Some("00000000000003E8"),
+            &expected.boot_identifier,
+        )
+        .is_err());
+
+        // Missing LUID, different session ID, different SID, or different boot ID.
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id,
+            sid,
+            None,
+            &expected.boot_identifier,
+        )
+        .is_err());
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id + 1,
+            sid,
+            Some(&expected.authentication_id),
+            &expected.boot_identifier,
+        )
+        .is_err());
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id,
+            "S-1-5-21-2",
+            Some(&expected.authentication_id),
+            &expected.boot_identifier,
+        )
+        .is_err());
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id,
+            sid,
+            Some(&expected.authentication_id),
+            "11111111-2222-4333-8444-555555555556",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn office_language_preferences_keeps_stable_sanitized_id() {
+        assert_eq!(
+            crate::sanitize_id("Office 语言首选项"),
+            "office-language-preferences"
+        );
     }
 
     #[test]

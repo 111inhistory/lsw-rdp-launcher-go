@@ -125,7 +125,7 @@ WTS 通知只触发异步刷新，不在回调内查询。SSH 和内存状态使
 
 ### 用户执行
 
-SYSTEM 后台在派发前校验完整 `SessionRef` 与配置的 `SID`，随后以目标会话的 WTS 用户 token、用户环境及 `winsta0\default` 桌面在受限本机命名管道上按需启动 `user-worker`。`session_status` 返回 worker 的实际 `SessionRef` 与 `SID` 以确认连接绑定，worker 内部不再进行冗余的逐请求身份复核。
+SYSTEM 后台在派发时获取目标会话的 WTS 用户 token，直接核对该 token 句柄自身的 Session ID、SID、AuthenticationId LUID 与当前内核 BootIdentifier 完全匹配预期 `SessionRef` 与配置 `SID` 后，使用同一已验证的 token 句柄、用户环境及 `winsta0\default` 桌面在受限本机命名管道上按需启动 `user-worker`。`session_status` 返回 worker 的实际 `SessionRef` 与 `SID` 以确认连接绑定。
 
 应用枚举、打开文件、快捷方式和映射盘请求均在目标用户上下文执行；工作目录设置为用户 Profile，不继承 SYSTEM cwd。不同登录的 `net use` 和重定向盘可能不同。
 

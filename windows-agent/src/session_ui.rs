@@ -80,8 +80,8 @@ unsafe fn own_agent(pid: u32) -> bool {
 // a supported complete tray snapshot API. Only the known prefix
 // of NOTIFYITEM is read, and no preferences or remote process memory are changed.
 // Shell capability absence is deliberately not treated as an empty tray.
-// Replace this adapter if a supported snapshot API becomes available. A
-// successful registration reports the icons it observed, including zero.
+// Replace this adapter if a supported snapshot API becomes available; do not
+// promote a successful registration with no callbacks to a proven zero count.
 const CLSID_TRAY: GUID = GUID::from_u128(0x25dead04_1eac_4911_9e3a_ad0a4ab560fd);
 const IID_TRAY: GUID = GUID::from_u128(0xd133ce13_3537_48ba_93a7_afcd5d2053b4);
 const IID_CB: GUID = GUID::from_u128(0xd782ccba_afb0_43f1_94db_fda3779eaccb);
@@ -218,10 +218,17 @@ unsafe fn tray_icons() -> Option<u32> {
     let result = if registered >= 0 {
         let unregistered = ((*(*tray).vtable).unregister)(tray, &mut cookie);
         if unregistered >= 0 {
-            // Registration succeeded, so the callbacks seen while it was held
-            // are the observation; an empty set is a real zero. UI counts are
-            // activity observations, never authorization for logoff.
-            (*cb).icons.lock().ok().map(|icons| icons.len() as u32)
+            // This private interface has no documented enumeration-complete
+            // signal. Positive observations prove activity, but no callback
+            // cannot prove an empty tray. UI counts are activity observations,
+            // never authorization for logoff.
+            (*cb).icons.lock().ok().and_then(|icons| {
+                if icons.is_empty() {
+                    None
+                } else {
+                    Some(icons.len() as u32)
+                }
+            })
         } else {
             None
         }

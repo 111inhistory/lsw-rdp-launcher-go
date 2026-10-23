@@ -28,7 +28,9 @@ use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-use crate::protocol::{take_frame, Ui, WorkerRequest, WorkerResponse, MAX_WORKER_FRAME_BYTES};
+use crate::protocol::{
+    take_frame, SessionRef, Ui, WorkerRequest, WorkerResponse, MAX_WORKER_FRAME_BYTES,
+};
 
 const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKER_EXIT_GRACE: Duration = Duration::from_secs(1);
@@ -298,15 +300,10 @@ fn read_frame(pipe: &Handle, event: &Handle, deadline: Instant, max: usize) -> i
     }
 }
 
-fn spawn_user_worker(session_id: u32, name: &str) -> io::Result<Handle> {
+fn spawn_user_worker_with_token(token: HANDLE, name: &str) -> io::Result<Handle> {
     unsafe {
-        let mut raw_token: HANDLE = ptr::null_mut();
-        if WTSQueryUserToken(session_id, &mut raw_token) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let token = Handle(raw_token);
         let mut raw_environment: *mut c_void = ptr::null_mut();
-        if CreateEnvironmentBlock(&mut raw_environment, token.0, 0) == 0 {
+        if CreateEnvironmentBlock(&mut raw_environment, token, 0) == 0 {
             return Err(io::Error::last_os_error());
         }
         let environment = EnvironmentBlock(raw_environment);
@@ -322,7 +319,7 @@ fn spawn_user_worker(session_id: u32, name: &str) -> io::Result<Handle> {
         startup.wShowWindow = SW_HIDE as u16;
         let mut process: PROCESS_INFORMATION = mem::zeroed();
         if CreateProcessAsUserW(
-            token.0,
+            token,
             wide(&executable.to_string_lossy()).as_ptr(),
             command_line.as_mut_ptr(),
             ptr::null(),
@@ -359,23 +356,17 @@ fn finish_process(process: &Handle) {
     }
 }
 
-/// Run one fixed user action in an already verified session and return the
-/// worker's response. The SYSTEM backend verifies the session reference before
-/// spawning this worker under the user's token, and the pipe admits only SYSTEM
-/// and that account, so no identity is repeated in the frame. Every stage is
-/// bounded by `timeout`.
-pub fn execute(
-    session_id: u32,
+fn execute_with_token(
+    token: HANDLE,
     configured_sid: &str,
     request: WorkerRequest,
-    timeout: Duration,
+    deadline: Instant,
 ) -> io::Result<WorkerResponse> {
-    let deadline = Instant::now() + timeout;
     remaining(deadline)?;
     let name = pipe_name();
     let pipe = create_pipe(&name, configured_sid)?;
     let event = event()?;
-    let process = spawn_user_worker(session_id, &name)?;
+    let process = spawn_user_worker_with_token(token, &name)?;
 
     let result = (|| -> io::Result<WorkerResponse> {
         // Native process creation is not cancellable. If the budget expired
@@ -394,12 +385,37 @@ pub fn execute(
     result
 }
 
+/// Open and verify the target session's user token against reference and
+/// configured_sid, then spawn the user worker with that exact verified token
+/// handle and return its response. Every stage shares the single timeout
+/// deadline without resetting the budget.
+pub fn execute(
+    reference: &SessionRef,
+    configured_sid: &str,
+    request: WorkerRequest,
+    timeout: Duration,
+) -> io::Result<WorkerResponse> {
+    let deadline = Instant::now() + timeout;
+    remaining(deadline)?;
+    let token = crate::session::open_verified_user_token(reference, configured_sid)?;
+    execute_with_token(token.as_raw(), configured_sid, request, deadline)
+}
+
 pub fn observe_ui(session_id: u32, configured_sid: &str, timeout: Duration) -> io::Result<Ui> {
-    let response = execute(
-        session_id,
+    let deadline = Instant::now() + timeout;
+    remaining(deadline)?;
+    let token = unsafe {
+        let mut raw_token: HANDLE = ptr::null_mut();
+        if WTSQueryUserToken(session_id, &mut raw_token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Handle(raw_token)
+    };
+    let response = execute_with_token(
+        token.0,
         configured_sid,
         WorkerRequest::ObserveUi,
-        timeout,
+        deadline,
     )?;
     if response.status != "ok" {
         return Err(io::Error::other(

@@ -306,6 +306,7 @@ fn sanitize_id(name: &str) -> String {
         "Windows 备份" => return "windows-backup".to_string(),
         "入门" => return "get-started".to_string(),
         "单击以执行" => return "click-to-do".to_string(),
+        "Office 语言首选项" => return "office-language-preferences".to_string(),
         _ => {}
     }
 
