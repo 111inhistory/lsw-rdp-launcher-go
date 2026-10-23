@@ -239,10 +239,14 @@ func (d *dialog) view(c *ui.Context) {
 // the window and returns the context error; it never starts a destructive
 // action.
 func Choose(ctx context.Context, prompt controller.SwitchPrompt) (controller.SwitchDecision, error) {
+	d := &dialog{prompt: prompt, decision: controller.SwitchCancel}
+	return d.run(ctx, ui.View(d.view))
+}
+
+func (d *dialog) run(ctx context.Context, content *ui.Content) (controller.SwitchDecision, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	d := &dialog{prompt: prompt, decision: controller.SwitchCancel}
 	if len(d.actions()) == 0 {
 		return "", fmt.Errorf("confirmation has no allowed actions")
 	}
@@ -265,14 +269,17 @@ func Choose(ctx context.Context, prompt controller.SwitchPrompt) (controller.Swi
 			}
 		}
 		width, height := d.size()
-		window := mygo.NewWindow(mygo.WindowOptions{Title: "切换 Windows 连接模式", Width: width, Height: height, MinWidth: width, MinHeight: height, DisableResize: true, Transparent: true, Content: ui.View(d.view)})
+		window := mygo.NewWindow(mygo.WindowOptions{Title: "切换 Windows 连接模式", Width: width, Height: height, MinWidth: width, MinHeight: height, DisableResize: true, Transparent: true, Content: content})
 		d.mu.Lock()
-		d.close = window.Close
+		// Button callbacks run while GTK is drawing the native view. Quit posts
+		// the close to the event loop; destroying the window inline can crash
+		// the CLI before it sends the decision back over IPC.
+		d.close = mygo.App.Quit
 		aborted = d.done
 		d.mu.Unlock()
 		window.OnClosed(d.closed)
 		if aborted {
-			window.Close()
+			mygo.App.Quit()
 		}
 	})
 	finished := make(chan struct{})
