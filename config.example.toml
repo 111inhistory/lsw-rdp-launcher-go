@@ -33,7 +33,7 @@ extra_args = []
 # SDL_RENDER_DRIVER = "opengl"
 
 [remoteapp]
-default_app = 'C:\RdpLauncher\bin\remoteapp-launcher.exe'
+default_app = 'C:\Program Files\RdpLauncher\remoteapp-launcher.exe'
 
 [lifecycle]
 vm_name = "win11"

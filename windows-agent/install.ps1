@@ -2,7 +2,7 @@
    running agents or changing login/service policy. #>
 [CmdletBinding()]
 param(
-    [string]$InstallDir = 'C:\RdpLauncher\bin',
+    [string]$InstallDir = 'C:\Program Files\RdpLauncher',
     [string]$SourceExe,
     [string]$AuthTokenFile = 'C:\ProgramData\rdp-launcher\agent-token',
     [string]$InteractiveUser = $env:USERNAME,

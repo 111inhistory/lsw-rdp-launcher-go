@@ -556,7 +556,7 @@ func (m *machine) begin(kind Kind, j *job, source OperationSource) *Operation {
 	}
 	m.nextID++
 	op := &Operation{ID: m.nextID, Kind: kind, Source: source, VM: m.state.VM, revision: m.revision, sessionGeneration: m.sessionGeneration, idleGeneration: m.idleGeneration, job: j}
-	if m.state.Binding != nil {
+	if m.state.Binding != nil && (j == nil || j.request.NeedsUser()) {
 		op.Reference = m.state.Binding.Reference
 	}
 	if source == SourceIdle && kind == InspectSession {

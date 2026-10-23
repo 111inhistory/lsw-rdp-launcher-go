@@ -29,8 +29,7 @@ use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use crate::protocol::{
-    take_frame, SessionRef, Ui, WorkerEnvelope, WorkerExpectedIdentity, WorkerRequest,
-    WorkerResponse, MAX_WORKER_FRAME_BYTES,
+    take_frame, SessionRef, Ui, WorkerRequest, WorkerResponse, MAX_WORKER_FRAME_BYTES,
 };
 
 const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -301,15 +300,10 @@ fn read_frame(pipe: &Handle, event: &Handle, deadline: Instant, max: usize) -> i
     }
 }
 
-fn spawn_user_worker(session_id: u32, name: &str) -> io::Result<Handle> {
+fn spawn_user_worker_with_token(token: HANDLE, name: &str) -> io::Result<Handle> {
     unsafe {
-        let mut raw_token: HANDLE = ptr::null_mut();
-        if WTSQueryUserToken(session_id, &mut raw_token) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let token = Handle(raw_token);
         let mut raw_environment: *mut c_void = ptr::null_mut();
-        if CreateEnvironmentBlock(&mut raw_environment, token.0, 0) == 0 {
+        if CreateEnvironmentBlock(&mut raw_environment, token, 0) == 0 {
             return Err(io::Error::last_os_error());
         }
         let environment = EnvironmentBlock(raw_environment);
@@ -325,7 +319,7 @@ fn spawn_user_worker(session_id: u32, name: &str) -> io::Result<Handle> {
         startup.wShowWindow = SW_HIDE as u16;
         let mut process: PROCESS_INFORMATION = mem::zeroed();
         if CreateProcessAsUserW(
-            token.0,
+            token,
             wide(&executable.to_string_lossy()).as_ptr(),
             command_line.as_mut_ptr(),
             ptr::null(),
@@ -362,44 +356,24 @@ fn finish_process(process: &Handle) {
     }
 }
 
-/// Run one fixed user action in an already verified session and return the
-/// worker's response. Every stage is bounded by `timeout`.
-pub fn execute(
-    session_id: u32,
+fn execute_with_token(
+    token: HANDLE,
     configured_sid: &str,
-    reference: &SessionRef,
     request: WorkerRequest,
-    timeout: Duration,
+    deadline: Instant,
 ) -> io::Result<WorkerResponse> {
-    let envelope = WorkerEnvelope {
-        expected: Some(WorkerExpectedIdentity {
-            reference: reference.clone(),
-            sid: configured_sid.to_string(),
-        }),
-        request,
-    };
-    execute_envelope(session_id, configured_sid, &envelope, timeout)
-}
-
-fn execute_envelope(
-    session_id: u32,
-    configured_sid: &str,
-    envelope: &WorkerEnvelope,
-    timeout: Duration,
-) -> io::Result<WorkerResponse> {
-    let deadline = Instant::now() + timeout;
     remaining(deadline)?;
     let name = pipe_name();
     let pipe = create_pipe(&name, configured_sid)?;
     let event = event()?;
-    let process = spawn_user_worker(session_id, &name)?;
+    let process = spawn_user_worker_with_token(token, &name)?;
 
     let result = (|| -> io::Result<WorkerResponse> {
         // Native process creation is not cancellable. If the budget expired
         // after it returned, do not submit the business frame at all.
         remaining(deadline)?;
         connect_server(&pipe, &event, deadline)?;
-        let mut frame = serde_json::to_vec(envelope).map_err(io::Error::other)?;
+        let mut frame = serde_json::to_vec(&request).map_err(io::Error::other)?;
         frame.push(b'\n');
         write_all(&pipe, &event, &frame, deadline)?;
         let response = read_frame(&pipe, &event, deadline, MAX_WORKER_FRAME_BYTES)?;
@@ -411,12 +385,32 @@ fn execute_envelope(
     result
 }
 
+/// Open and verify the target session's user token against reference and
+/// configured_sid, then spawn the user worker with that exact verified token
+/// handle and return its response. The caller fixes deadline before queuing on
+/// the blocking pool so queue wait is deducted before any token or process work.
+pub fn execute(
+    reference: &SessionRef,
+    configured_sid: &str,
+    request: WorkerRequest,
+    deadline: Instant,
+) -> io::Result<WorkerResponse> {
+    remaining(deadline)?;
+    let token = crate::session::open_verified_user_token(reference, configured_sid)?;
+    execute_with_token(token.as_raw(), configured_sid, request, deadline)
+}
+
 pub fn observe_ui(session_id: u32, configured_sid: &str, timeout: Duration) -> io::Result<Ui> {
-    let envelope = WorkerEnvelope {
-        expected: None,
-        request: WorkerRequest::ObserveUi,
+    let deadline = Instant::now() + timeout;
+    remaining(deadline)?;
+    let token = unsafe {
+        let mut raw_token: HANDLE = ptr::null_mut();
+        if WTSQueryUserToken(session_id, &mut raw_token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Handle(raw_token)
     };
-    let response = execute_envelope(session_id, configured_sid, &envelope, timeout)?;
+    let response = execute_with_token(token.0, configured_sid, WorkerRequest::ObserveUi, deadline)?;
     if response.status != "ok" {
         return Err(io::Error::other(
             response
@@ -532,21 +526,6 @@ fn write_client_all(pipe: &Handle, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_worker_request(
-    expected: Option<&WorkerExpectedIdentity>,
-    request: &WorkerRequest,
-) -> Result<(), String> {
-    if matches!(request, WorkerRequest::ObserveUi) {
-        // Internal UI observation is display-only; it never authorizes an
-        // action and is allowed to omit the expected logon identity.
-        return Ok(());
-    }
-    let expected = expected
-        .ok_or_else(|| "user worker action requires expected SessionRef and SID".to_string())?;
-    crate::session::verify_worker_expected(expected)
-        .map_err(|error| format!("user worker identity check failed: {error}"))
-}
-
 fn execute_in_worker(request: WorkerRequest) -> WorkerResponse {
     match request {
         WorkerRequest::Run {
@@ -598,14 +577,11 @@ pub fn run_client(name: &str) -> io::Result<()> {
     let deadline = Instant::now() + WORKER_CONNECT_TIMEOUT;
     let pipe = connect_client(name, deadline)?;
     let frame = read_client_frame(&pipe, deadline)?;
-    let envelope: WorkerEnvelope = serde_json::from_slice(&frame).map_err(io::Error::other)?;
+    let request: WorkerRequest = serde_json::from_slice(&frame).map_err(io::Error::other)?;
 
     let com_initialized =
         unsafe { CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32) } >= 0;
-    let response = match validate_worker_request(envelope.expected.as_ref(), &envelope.request) {
-        Ok(()) => execute_in_worker(envelope.request),
-        Err(error) => WorkerResponse::error(error),
-    };
+    let response = execute_in_worker(request);
     if com_initialized {
         unsafe {
             CoUninitialize();
@@ -636,15 +612,52 @@ mod tests {
     }
 
     #[test]
-    fn business_worker_actions_require_expected_identity_but_ui_observation_does_not() {
-        let run = WorkerRequest::Run {
-            target: "notepad.exe".into(),
-            params: None,
-            working_dir: None,
+    fn pre_queued_deadline_expiration_aborts_before_token_or_worker_execution() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        let (occupied_tx, occupied_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            occupied_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        occupied_rx.recv().unwrap();
+
+        // Fix the deadline before submitting to the saturated blocking pool,
+        // matching backend.rs. If execute entered open_verified_user_token,
+        // this invalid session_id=0 reference would fail with a validation
+        // error instead of TimedOut.
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let invalid_ref = SessionRef {
+            session_id: 0,
+            authentication_id: String::new(),
+            boot_identifier: String::new(),
         };
-        let error = validate_worker_request(None, &run).expect_err("unbound business action");
-        assert!(error.contains("requires expected SessionRef"), "{error}");
-        assert!(validate_worker_request(None, &WorkerRequest::ObserveUi).is_ok());
+        let queued = runtime.spawn_blocking(move || {
+            execute(
+                &invalid_ref,
+                "S-1-5-21-1",
+                WorkerRequest::GetMappedDrives,
+                deadline,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(35));
+        release_tx.send(()).unwrap();
+
+        let error = runtime
+            .block_on(async {
+                blocker.await.unwrap();
+                queued.await.unwrap()
+            })
+            .expect_err("expired queued request must not execute");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::TimedOut,
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

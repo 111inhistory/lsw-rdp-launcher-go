@@ -287,52 +287,35 @@ pub enum WorkerRequest {
     SessionStatus,
 }
 
-/// The backend binds every executable worker request to the logon identity it
-/// verified before spawning. The worker re-checks this against its own session
-/// and token; it never trusts the requested value as proof of placement.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct WorkerExpectedIdentity {
-    pub reference: SessionRef,
-    pub sid: String,
-}
-
-/// One worker frame: an optional expected identity plus the fixed action. UI
-/// observation is internal, non-authoritative data and may omit the identity.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct WorkerEnvelope {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected: Option<WorkerExpectedIdentity>,
-    #[serde(flatten)]
-    pub request: WorkerRequest,
-}
-
-/// Compare the worker's actual logon identity with the identity the backend
-/// verified before spawning. A matching Session ID and SID are not enough: a
-/// same-account re-logon changes the AuthenticationId.
+/// Compare the actual identity of an opened user token (or worker status) with
+/// the expected SessionRef and configured SID before using that token handle.
+/// A matching Session ID and SID are not enough: a same-account re-logon
+/// changes the AuthenticationId.
 pub fn verify_worker_identity(
     expected_reference: &SessionRef,
     expected_sid: &str,
-    actual_reference: &SessionRef,
+    actual_session_id: u32,
     actual_sid: &str,
+    actual_authentication_id: Option<&str>,
+    actual_boot_identifier: &str,
 ) -> Result<(), String> {
     expected_reference.validate()?;
-    actual_reference.validate()?;
-    if expected_reference.session_id != actual_reference.session_id {
-        return Err("worker executes in a different session".into());
+    if !same_boot_identifier(&expected_reference.boot_identifier, actual_boot_identifier) {
+        return Err("boot identifier changed; session reference is stale".into());
+    }
+    if expected_reference.session_id != actual_session_id {
+        return Err("user token belongs to a different session".into());
     }
     if expected_sid != actual_sid {
-        return Err("worker account SID does not match the expected logon".into());
+        return Err("target session account SID does not match the configured account".into());
     }
-    if expected_reference.authentication_id != actual_reference.authentication_id {
-        return Err("worker logon AuthenticationId does not match the expected logon".into());
+    match actual_authentication_id {
+        Some(authentication_id) if authentication_id == expected_reference.authentication_id => {
+            Ok(())
+        }
+        Some(_) => Err("target session logon identity changed; session reference is stale".into()),
+        None => Err("target session logon identity is unavailable".into()),
     }
-    if !same_boot_identifier(
-        &expected_reference.boot_identifier,
-        &actual_reference.boot_identifier,
-    ) {
-        return Err("worker boot identifier does not match the expected logon".into());
-    }
-    Ok(())
 }
 
 impl From<HostAction> for Option<WorkerRequest> {
@@ -472,7 +455,7 @@ mod tests {
     fn reference() -> SessionRef {
         SessionRef {
             session_id: 4,
-            authentication_id: "0000000003C517EA".into(),
+            authentication_id: "00000000000003E7".into(),
             boot_identifier: "11111111-2222-4333-8444-555555555555".into(),
         }
     }
@@ -481,7 +464,7 @@ mod tests {
     fn session_reference_uses_the_approved_field_names_and_validation() {
         let value = serde_json::to_value(reference()).unwrap();
         assert_eq!(value["session_id"], 4);
-        assert_eq!(value["authentication_id"], "0000000003C517EA");
+        assert_eq!(value["authentication_id"], "00000000000003E7");
         assert_eq!(
             value["boot_identifier"],
             "11111111-2222-4333-8444-555555555555"
@@ -494,11 +477,11 @@ mod tests {
                 ..reference()
             },
             SessionRef {
-                authentication_id: "0000000003c517ea".into(),
+                authentication_id: "00000000000003e7".into(),
                 ..reference()
             },
             SessionRef {
-                authentication_id: "0000000003C517E".into(),
+                authentication_id: "00000000000003E".into(),
                 ..reference()
             },
             SessionRef {
@@ -513,30 +496,30 @@ mod tests {
     #[test]
     fn boot_identifiers_compare_without_case_folding_the_raw_reference() {
         assert!(same_boot_identifier(
-            "11111111-2222-4333-8444-555555555555",
-            "AF319887-9FD7-11F1-B633-EF01453EABE6"
+            "aa11bb22-cc33-44dd-88ee-ff0011223344",
+            "AA11BB22-CC33-44DD-88EE-FF0011223344"
         ));
         assert!(!same_boot_identifier(
-            "11111111-2222-4333-8444-555555555555",
-            "af319887-9fd7-11f1-b633-ef01453eabe7"
+            "aa11bb22-cc33-44dd-88ee-ff0011223344",
+            "aa11bb22-cc33-44dd-88ee-ff0011223345"
         ));
     }
 
     #[test]
     fn formats_luid_guid_and_wts_client_addresses() {
-        assert_eq!(format_authentication_id(0, 0x03C5_17EA), "0000000003C517EA");
+        assert_eq!(format_authentication_id(0, 0x03E7), "00000000000003E7");
         assert_eq!(
             format_guid(
-                0xaf31_9887,
-                0x9fd7,
-                0x11f1,
-                [0xb6, 0x33, 0xef, 0x01, 0x45, 0x3e, 0xab, 0xe6]
+                0x1111_1111,
+                0x2222,
+                0x4333,
+                [0x84, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55]
             ),
             "11111111-2222-4333-8444-555555555555"
         );
         let mut v4 = [0u8; 20];
-        // WTS IPv4 layout for the test host's 192.0.2.1 address.
-        v4[..6].copy_from_slice(&[0, 0, 192, 168, 122, 1]);
+        // WTS IPv4 layout for the documentation address 192.0.2.1.
+        v4[..6].copy_from_slice(&[0, 0, 192, 0, 2, 1]);
         assert_eq!(format_client_address(2, &v4), "192.0.2.1");
         v4[..2].copy_from_slice(&[0x12, 0x34]);
         assert_eq!(format_client_address(2, &v4), "192.0.2.1");
@@ -554,6 +537,78 @@ mod tests {
         assert!(error.message.contains("upgraded together"));
         assert!(check_protocol(&serde_json::json!({"action": "ping", "protocol": 1})).is_err());
         assert!(check_protocol(&serde_json::json!({"action": "ping", "protocol": 2})).is_ok());
+    }
+
+    #[test]
+    fn same_sid_with_different_luid_or_boot_is_rejected() {
+        let expected = reference();
+        let sid = "S-1-5-21-1";
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id,
+            sid,
+            Some(&expected.authentication_id),
+            &expected.boot_identifier,
+        )
+        .is_ok());
+
+        // Same account SID and session ID, but a new logon LUID reused the ID.
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id,
+            sid,
+            Some("00000000000003E8"),
+            &expected.boot_identifier,
+        )
+        .is_err());
+
+        // Missing LUID, different session ID, different SID, or different boot ID.
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id,
+            sid,
+            None,
+            &expected.boot_identifier,
+        )
+        .is_err());
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id + 1,
+            sid,
+            Some(&expected.authentication_id),
+            &expected.boot_identifier,
+        )
+        .is_err());
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id,
+            "S-1-5-21-2",
+            Some(&expected.authentication_id),
+            &expected.boot_identifier,
+        )
+        .is_err());
+        assert!(verify_worker_identity(
+            &expected,
+            sid,
+            expected.session_id,
+            sid,
+            Some(&expected.authentication_id),
+            "11111111-2222-4333-8444-555555555556",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn office_language_preferences_keeps_stable_sanitized_id() {
+        assert_eq!(
+            crate::sanitize_id("Office 语言首选项"),
+            "office-language-preferences"
+        );
     }
 
     #[test]
@@ -637,7 +692,7 @@ mod tests {
             user: "user".into(),
             domain: "machine".into(),
             state: 0,
-            client_name: "lswD2210a001".into(),
+            client_name: "rdp-test-client".into(),
             client_address: "192.0.2.10".into(),
             logon_time: 100,
             connect_time: 200,
@@ -672,79 +727,6 @@ mod tests {
         assert!(matches!(worker, WorkerRequest::GetMappedDrives));
         let worker: WorkerRequest = serde_json::from_str(r#"{"action":"observe_ui"}"#).unwrap();
         assert!(matches!(worker, WorkerRequest::ObserveUi));
-    }
-
-    #[test]
-    fn worker_envelope_carries_expected_identity_for_executable_actions() {
-        let expected = WorkerExpectedIdentity {
-            reference: reference(),
-            sid: "S-1-5-21-1".into(),
-        };
-        let envelope = WorkerEnvelope {
-            expected: Some(expected.clone()),
-            request: WorkerRequest::SessionStatus,
-        };
-        let value = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(value["action"], "session_status");
-        assert_eq!(
-            value["expected"]["reference"],
-            serde_json::to_value(reference()).unwrap()
-        );
-        assert_eq!(value["expected"]["sid"], "S-1-5-21-1");
-        let decoded: WorkerEnvelope = serde_json::from_value(value).unwrap();
-        assert_eq!(decoded.expected, Some(expected));
-        assert!(matches!(decoded.request, WorkerRequest::SessionStatus));
-
-        let observe = WorkerEnvelope {
-            expected: None,
-            request: WorkerRequest::ObserveUi,
-        };
-        let value = serde_json::to_value(&observe).unwrap();
-        assert_eq!(value["action"], "observe_ui");
-        assert!(value.get("expected").is_none());
-        let decoded: WorkerEnvelope = serde_json::from_value(value).unwrap();
-        assert!(decoded.expected.is_none());
-        assert!(matches!(decoded.request, WorkerRequest::ObserveUi));
-    }
-
-    #[test]
-    fn worker_identity_rejects_same_session_and_sid_with_a_different_luid() {
-        let expected = reference();
-        let actual = SessionRef {
-            authentication_id: "0000000003D481ED".into(),
-            ..reference()
-        };
-        let error = verify_worker_identity(&expected, "S-1-5-21-1", &actual, "S-1-5-21-1")
-            .expect_err("same-account re-logon was accepted");
-        assert!(error.contains("AuthenticationId"), "{error}");
-
-        let exact = verify_worker_identity(&expected, "S-1-5-21-1", &expected, "S-1-5-21-1");
-        assert!(exact.is_ok());
-
-        let wrong_sid = verify_worker_identity(&expected, "S-1-5-21-1", &expected, "S-1-5-21-2");
-        assert!(wrong_sid.unwrap_err().contains("SID"));
-
-        let wrong_boot = verify_worker_identity(
-            &expected,
-            "S-1-5-21-1",
-            &SessionRef {
-                boot_identifier: "af319887-9fd7-11f1-b633-ef01453eabe7".into(),
-                ..reference()
-            },
-            "S-1-5-21-1",
-        );
-        assert!(wrong_boot.unwrap_err().contains("boot identifier"));
-
-        let wrong_session = verify_worker_identity(
-            &expected,
-            "S-1-5-21-1",
-            &SessionRef {
-                session_id: 6,
-                ..reference()
-            },
-            "S-1-5-21-1",
-        );
-        assert!(wrong_session.unwrap_err().contains("session"));
     }
 
     #[test]

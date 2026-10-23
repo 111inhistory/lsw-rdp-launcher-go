@@ -89,7 +89,7 @@ func watchAgent(t *testing.T, handle func(net.Conn)) Agent {
 func sampleRef() controller.SessionRef {
 	return controller.SessionRef{
 		SessionID:        4,
-		AuthenticationID: "0000000003C517EA",
+		AuthenticationID: "00000000000003E7",
 		BootIdentifier:   "11111111-2222-4333-8444-555555555555",
 	}
 }
@@ -104,7 +104,7 @@ func sampleSnapshot(revision uint64, fresh bool) controller.SessionSnapshot {
 			User:          "user",
 			Domain:        "MACHINE",
 			State:         controller.WTSActive,
-			ClientName:    "lswD2210a001",
+			ClientName:    "rdp-test-client",
 			ClientAddress: "192.0.2.10",
 			LogonTime:     100,
 			ConnectTime:   200,

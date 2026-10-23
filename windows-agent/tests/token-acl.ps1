@@ -1,9 +1,9 @@
 # Windows-only acceptance fixture for shared-token provisioning/verification.
 #
-# Validated on Win11 via SSH using temporary fixtures. This script changes only a temporary
-# directory and, with -RunAsAdministrator, one uniquely named temporary SYSTEM
-# scheduled task that is removed in a finally block. It never touches the
-# production token path, service, or task scheduler entries.
+# This script changes only a temporary directory and, with -RunAsAdministrator,
+# one uniquely named temporary SYSTEM scheduled task that is removed in a
+# finally block. It never touches the production token path, service, or task
+# scheduler entries.
 [CmdletBinding()]
 param(
     [switch]$RunAsAdministrator,

@@ -298,7 +298,7 @@ mod tests {
         ));
 
         let mut run: Value = serde_json::from_str(
-            r#"{"action":"run","protocol":2,"token":"secret","target":"notepad.exe","params":null,"session_ref":{"session_id":4,"authentication_id":"0000000003C517EA","boot_identifier":"11111111-2222-4333-8444-555555555555"}}"#,
+            r#"{"action":"run","protocol":2,"token":"secret","target":"notepad.exe","params":null,"session_ref":{"session_id":4,"authentication_id":"00000000000003E7","boot_identifier":"11111111-2222-4333-8444-555555555555"}}"#,
         )
         .unwrap();
         remove_token_field(&mut run);

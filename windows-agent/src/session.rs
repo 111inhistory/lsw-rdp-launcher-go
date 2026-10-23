@@ -26,8 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::protocol::{
     apply_observation, format_authentication_id, format_client_address, format_guid, invalidate,
-    same_boot_identifier, verify_worker_identity, Observation, SessionEntry, SessionRef, Snapshot,
-    WorkerExpectedIdentity, WorkerSessionStatus,
+    verify_worker_identity, Observation, SessionEntry, SessionRef, Snapshot, WorkerSessionStatus,
 };
 use crate::worker;
 
@@ -78,12 +77,18 @@ impl Access {
     }
 }
 
-struct Handle(HANDLE);
+pub struct VerifiedUserToken(HANDLE);
 
-impl Drop for Handle {
+impl VerifiedUserToken {
+    pub(crate) fn as_raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for VerifiedUserToken {
     fn drop(&mut self) {
         unsafe {
-            if !self.0.is_null() {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
                 CloseHandle(self.0);
             }
         }
@@ -161,26 +166,34 @@ pub fn resolve_sid(account: &str) -> io::Result<String> {
 }
 
 struct TokenIdentity {
+    session_id: u32,
     sid: String,
     authentication_id: Option<String>,
 }
 
-fn token_identity(session_id: u32) -> io::Result<TokenIdentity> {
+fn inspect_token_handle(token: HANDLE) -> io::Result<TokenIdentity> {
     unsafe {
-        let mut raw_token = ptr::null_mut();
-        if WTSQueryUserToken(session_id, &mut raw_token) == 0 {
+        let mut session_id = 0u32;
+        let mut session_len = 0u32;
+        if GetTokenInformation(
+            token,
+            TokenSessionId,
+            (&mut session_id as *mut u32).cast(),
+            mem::size_of::<u32>() as u32,
+            &mut session_len,
+        ) == 0
+        {
             return Err(io::Error::last_os_error());
         }
-        let token = Handle(raw_token);
 
         let mut needed = 0u32;
-        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut needed);
+        GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut needed);
         if needed == 0 {
             return Err(io::Error::last_os_error());
         }
         let mut user = vec![0u8; needed as usize];
         if GetTokenInformation(
-            token.0,
+            token,
             TokenUser,
             user.as_mut_ptr().cast(),
             needed,
@@ -198,7 +211,7 @@ fn token_identity(session_id: u32) -> io::Result<TokenIdentity> {
         let mut statistics: TOKEN_STATISTICS = mem::zeroed();
         let mut length = 0u32;
         let authentication_id = (GetTokenInformation(
-            token.0,
+            token,
             TokenStatistics,
             (&mut statistics as *mut TOKEN_STATISTICS).cast(),
             mem::size_of::<TOKEN_STATISTICS>() as u32,
@@ -211,10 +224,26 @@ fn token_identity(session_id: u32) -> io::Result<TokenIdentity> {
                 )
             });
         Ok(TokenIdentity {
+            session_id,
             sid,
             authentication_id,
         })
     }
+}
+
+fn open_session_token(session_id: u32) -> io::Result<VerifiedUserToken> {
+    unsafe {
+        let mut raw_token = ptr::null_mut();
+        if WTSQueryUserToken(session_id, &mut raw_token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(VerifiedUserToken(raw_token))
+    }
+}
+
+fn token_identity(session_id: u32) -> io::Result<TokenIdentity> {
+    let token = open_session_token(session_id)?;
+    inspect_token_handle(token.0)
 }
 
 #[repr(C)]
@@ -260,86 +289,28 @@ fn account_name_from_sid(sid_string: &str) -> io::Result<String> {
     }
 }
 
-fn current_process_identity() -> io::Result<(String, String)> {
-    unsafe {
-        let mut token = ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let token = Handle(token);
-
-        let mut needed = 0u32;
-        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut needed);
-        if needed == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut user = vec![0u8; needed as usize];
-        if GetTokenInformation(
-            token.0,
-            TokenUser,
-            user.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let sid = sid_to_string(
-            ptr::read_unaligned(user.as_ptr() as *const TOKEN_USER)
-                .User
-                .Sid,
-        )?;
-
-        let mut statistics: TOKEN_STATISTICS = mem::zeroed();
-        let mut length = 0u32;
-        if GetTokenInformation(
-            token.0,
-            TokenStatistics,
-            (&mut statistics as *mut TOKEN_STATISTICS).cast(),
-            mem::size_of::<TOKEN_STATISTICS>() as u32,
-            &mut length,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let authentication_id = format_authentication_id(
-            statistics.AuthenticationId.HighPart,
-            statistics.AuthenticationId.LowPart,
-        );
-        Ok((sid, authentication_id))
-    }
-}
-
-fn current_session_id() -> io::Result<u32> {
-    let mut session_id = 0u32;
-    if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) } == 0 {
+/// Read the worker's own complete logon identity from its process token. The
+/// SYSTEM backend already verified the token used to spawn this worker.
+pub fn current_worker_identity() -> io::Result<(SessionRef, String)> {
+    let mut raw_token = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(session_id)
-}
-
-/// Read the worker's own complete logon identity. This is the authority the
-/// worker checks before any business action, independently of the request.
-pub fn current_worker_identity() -> io::Result<(SessionRef, String)> {
-    let session_id = current_session_id()?;
-    let (sid, authentication_id) = current_process_identity()?;
+    let token = VerifiedUserToken(raw_token);
+    let identity = inspect_token_handle(token.0)?;
     let reference = SessionRef {
-        session_id,
-        authentication_id,
+        session_id: identity.session_id,
+        authentication_id: identity
+            .authentication_id
+            .ok_or_else(|| io::Error::other("user worker logon identity is unavailable"))?,
         boot_identifier: boot_identifier()?,
     };
     reference.validate().map_err(io::Error::other)?;
-    Ok((reference, sid))
+    Ok((reference, identity.sid))
 }
 
-pub fn verify_worker_expected(expected: &WorkerExpectedIdentity) -> io::Result<()> {
-    let (actual, actual_sid) = current_worker_identity()?;
-    verify_worker_identity(&expected.reference, &expected.sid, &actual, &actual_sid)
-        .map_err(io::Error::other)
-}
-
-/// Report the worker's actual execution session and reference. The backend
-/// compares this actual value with the reference it verified before spawning.
+/// Report the worker's actual execution session and reference as observed
+/// data about the verified session it was started in.
 pub fn worker_status() -> io::Result<WorkerSessionStatus> {
     let (reference, sid) = current_worker_identity()?;
     let session = raw_session(reference.session_id)?;
@@ -593,38 +564,35 @@ pub fn observe(configured_sid: &str) -> io::Result<Observation> {
     })
 }
 
+/// Open the WTS user token for the target session and verify that the exact
+/// opened token handle (Session ID, SID, AuthenticationId LUID) and current
+/// boot identifier match reference and configured_sid. Callers pass this
+/// same returned token handle directly to CreateEnvironmentBlock and
+/// CreateProcessAsUserW, eliminating any re-query window.
+pub fn open_verified_user_token(
+    reference: &SessionRef,
+    configured_sid: &str,
+) -> io::Result<VerifiedUserToken> {
+    reference.validate().map_err(io::Error::other)?;
+    let boot = boot_identifier()?;
+    let token = open_session_token(reference.session_id)?;
+    let identity = inspect_token_handle(token.0)?;
+    verify_worker_identity(
+        reference,
+        configured_sid,
+        identity.session_id,
+        &identity.sid,
+        identity.authentication_id.as_deref(),
+        &boot,
+    )
+    .map_err(io::Error::other)?;
+    Ok(token)
+}
+
 /// Final pre-execution identity check. Errors mean the target must not be
 /// dispatched or logged off.
 pub fn verify_reference(reference: &SessionRef, configured_sid: &str) -> io::Result<()> {
-    reference.validate().map_err(io::Error::other)?;
-    let boot = boot_identifier()?;
-    if !same_boot_identifier(&reference.boot_identifier, &boot) {
-        return Err(io::Error::other(
-            "boot identifier changed; session reference is stale",
-        ));
-    }
-    if !session_present(reference.session_id)? {
-        return Err(io::Error::other("target session no longer exists"));
-    }
-    let raw = raw_session(reference.session_id)?;
-    if raw.user.is_empty() {
-        return Err(io::Error::other("target session has no logged-on user"));
-    }
-    let identity = token_identity(reference.session_id)?;
-    if identity.sid != configured_sid {
-        return Err(io::Error::other(
-            "target session account SID does not match the configured account",
-        ));
-    }
-    match identity.authentication_id {
-        Some(authentication_id) if authentication_id == reference.authentication_id => Ok(()),
-        Some(_) => Err(io::Error::other(
-            "target session logon identity changed; session reference is stale",
-        )),
-        None => Err(io::Error::other(
-            "target session logon identity is unavailable",
-        )),
-    }
+    open_verified_user_token(reference, configured_sid).map(|_| ())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1072,6 +1040,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_inspection_reads_current_process_identity() {
+        let mut raw_token = ptr::null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) },
+            0
+        );
+        let token = VerifiedUserToken(raw_token);
+        let identity = inspect_token_handle(token.0).unwrap();
+        let mut session_id = 0u32;
+        assert_ne!(
+            unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) },
+            0
+        );
+        assert_eq!(identity.session_id, session_id);
+        assert!(identity.sid.starts_with("S-1-"));
+        assert!(identity.authentication_id.is_some());
+    }
+
+    #[test]
     fn access_requires_both_configured_host_and_user() {
         let access = Access {
             user: "user".into(),
@@ -1089,7 +1076,7 @@ mod tests {
     #[test]
     fn poll_classification_distinguishes_gone_same_reuse_and_unknown() {
         let sid = "S-1-5-21-1";
-        let expected = "0000000003C517EA";
+        let expected = "00000000000003E7";
         assert_eq!(
             classify_poll(false, None, None, sid, expected),
             PollState::Gone
@@ -1099,7 +1086,7 @@ mod tests {
             PollState::Same
         );
         assert_eq!(
-            classify_poll(true, Some(sid), Some("0000000003D481ED"), sid, expected),
+            classify_poll(true, Some(sid), Some("00000000000003E8"), sid, expected),
             PollState::Reused
         );
         assert_eq!(

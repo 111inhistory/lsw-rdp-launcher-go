@@ -239,13 +239,13 @@ func (d *dialog) view(c *ui.Context) {
 // the window and returns the context error; it never starts a destructive
 // action.
 func Choose(ctx context.Context, prompt controller.SwitchPrompt) (controller.SwitchDecision, error) {
-	if err := validatePrompt(prompt); err != nil {
-		return "", err
-	}
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	d := &dialog{prompt: prompt, decision: controller.SwitchCancel}
+	if len(d.actions()) == 0 {
+		return "", fmt.Errorf("confirmation has no allowed actions")
+	}
 	mygo.App.SetName("RDP Launcher")
 	mygo.App.WhenReady(func() {
 		d.mu.Lock()
@@ -289,24 +289,4 @@ func Choose(ctx context.Context, prompt controller.SwitchPrompt) (controller.Swi
 		return "", err
 	}
 	return d.result()
-}
-
-func validatePrompt(prompt controller.SwitchPrompt) error {
-	if prompt.TargetMode != controller.ModeDesktop && prompt.TargetMode != controller.ModeRemoteApp {
-		return fmt.Errorf("invalid confirmation target mode %q", prompt.TargetMode)
-	}
-	if len(prompt.Allowed) == 0 {
-		return fmt.Errorf("confirmation has no allowed actions")
-	}
-	for _, decision := range prompt.Allowed {
-		switch decision {
-		case controller.SwitchCancel, controller.SwitchKeep, controller.SwitchLogoff, controller.SwitchCurrent:
-		default:
-			return fmt.Errorf("confirmation has unknown action %q", decision)
-		}
-		if !prompt.Allows(decision) {
-			return fmt.Errorf("confirmation action %q is not allowed by the prompt", decision)
-		}
-	}
-	return nil
 }

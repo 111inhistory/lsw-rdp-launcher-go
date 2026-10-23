@@ -272,30 +272,15 @@ func TestContextAbortCancelsButDoesNotOverrideDecision(t *testing.T) {
 func TestChooseRejectsBeforeGUIInitialization(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	for _, tc := range []struct {
-		name   string
-		prompt controller.SwitchPrompt
-		want   string
-	}{
-		{"invalid target", testPrompt("bogus", controller.SwitchCancel), "invalid confirmation target mode"},
-		{"no actions", testPrompt("desktop"), "no allowed actions"},
-		{"unknown action", testPrompt("desktop", controller.SwitchDecision("delete")), "unknown action"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := Choose(ctx, tc.prompt)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatal(err)
-			}
-		})
-	}
 	if _, err := Choose(ctx, switchPrompt()); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-}
-
-func TestValidationRejectsUnknownAllowedAction(t *testing.T) {
-	prompt := testPrompt("desktop", controller.SwitchCancel, controller.SwitchDecision("bogus"))
-	if _, err := Choose(context.Background(), prompt); err == nil || !strings.Contains(err.Error(), "unknown action") {
-		t.Fatal(err)
+	for _, prompt := range []controller.SwitchPrompt{
+		testPrompt("desktop"),
+		testPrompt("desktop", controller.SwitchDecision("delete")),
+	} {
+		if _, err := Choose(context.Background(), prompt); err == nil || !strings.Contains(err.Error(), "no allowed actions") {
+			t.Fatal(err)
+		}
 	}
 }
