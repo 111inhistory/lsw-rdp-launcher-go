@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "remoteapp-launcher"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "ferrisetw",
  "flexi_logger",

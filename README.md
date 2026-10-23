@@ -146,4 +146,5 @@ make check
 - [自动内存控制与恢复](docs/memory.md)
 - [virtio-mem 驱动约束](docs/virtio-mem-driver-notes.md)
 - [开发与测试](docs/development.md)
+- [v0.2.0 发布说明](docs/releases/v0.2.0.md)
 - [v0.1.0 历史版本说明](docs/releases/v0.1.0.md)
