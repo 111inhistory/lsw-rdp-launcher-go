@@ -26,8 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::protocol::{
     apply_observation, format_authentication_id, format_client_address, format_guid, invalidate,
-    same_boot_identifier, verify_worker_identity, Observation, SessionEntry, SessionRef, Snapshot,
-    WorkerExpectedIdentity, WorkerSessionStatus,
+    same_boot_identifier, Observation, SessionEntry, SessionRef, Snapshot, WorkerSessionStatus,
 };
 use crate::worker;
 
@@ -318,8 +317,9 @@ fn current_session_id() -> io::Result<u32> {
     Ok(session_id)
 }
 
-/// Read the worker's own complete logon identity. This is the authority the
-/// worker checks before any business action, independently of the request.
+/// Read the worker's own complete logon identity. The SYSTEM backend already
+/// verified the target session before spawning, so this only reports the
+/// session the worker actually landed in.
 pub fn current_worker_identity() -> io::Result<(SessionRef, String)> {
     let session_id = current_session_id()?;
     let (sid, authentication_id) = current_process_identity()?;
@@ -332,14 +332,8 @@ pub fn current_worker_identity() -> io::Result<(SessionRef, String)> {
     Ok((reference, sid))
 }
 
-pub fn verify_worker_expected(expected: &WorkerExpectedIdentity) -> io::Result<()> {
-    let (actual, actual_sid) = current_worker_identity()?;
-    verify_worker_identity(&expected.reference, &expected.sid, &actual, &actual_sid)
-        .map_err(io::Error::other)
-}
-
-/// Report the worker's actual execution session and reference. The backend
-/// compares this actual value with the reference it verified before spawning.
+/// Report the worker's actual execution session and reference as observed
+/// data about the verified session it was started in.
 pub fn worker_status() -> io::Result<WorkerSessionStatus> {
     let (reference, sid) = current_worker_identity()?;
     let session = raw_session(reference.session_id)?;

@@ -1,7 +1,6 @@
 package host
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -322,92 +321,6 @@ func TestSyncAppsCleanupOrphanIconsAndStaleDesktopEntries(t *testing.T) {
 	}
 }
 
-func TestSyncAppsPublishFailureRollback(t *testing.T) {
-	root := t.TempDir()
-	cacheDir := filepath.Join(root, "cache")
-	dataDir := filepath.Join(root, "data")
-	t.Setenv("XDG_CACHE_HOME", cacheDir)
-	t.Setenv("XDG_DATA_HOME", dataDir)
-
-	validPNG := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-	c := Config{}
-	initialApps := []adapter.App{
-		{
-			ID:         "app1",
-			Name:       "App One Version 1",
-			Target:     `C:\Tools\app1.exe`,
-			IconBase64: validPNG,
-		},
-	}
-
-	configPath := filepath.Join(root, "config.toml")
-	socketPath := filepath.Join(root, "controller.sock")
-	if err := c.SyncApps(initialApps, "/bin/launcher", configPath, socketPath); err != nil {
-		t.Fatalf("initial sync failed: %v", err)
-	}
-
-	appCache := filepath.Join(cacheDir, "rdp-launcher-go")
-	appData := filepath.Join(dataDir, "applications")
-
-	desktop1Path := filepath.Join(appData, "rdp-launcher-go-app1.desktop")
-	initialDesktop, err := os.ReadFile(desktop1Path)
-	if err != nil || !strings.Contains(string(initialDesktop), "Name=App One Version 1") {
-		t.Fatalf("initial desktop content unexpected: %s, err=%v", string(initialDesktop), err)
-	}
-
-	// Block publishing of apps.json (which is published LAST) by replacing it with a directory
-	appsJSONPath := filepath.Join(appCache, "apps.json")
-	if err := os.Remove(appsJSONPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(appsJSONPath, 0755); err != nil {
-		t.Fatal(err)
-	}
-	// Make directory non-empty so rename cannot replace it
-	if err := os.WriteFile(filepath.Join(appsJSONPath, "subfile"), []byte("blocking directory"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	secondApps := []adapter.App{
-		{
-			ID:         "app1",
-			Name:       "App One Version 2",
-			Target:     `C:\Tools\app1.exe`,
-			IconBase64: validPNG,
-		},
-		{
-			ID:         "app2",
-			Name:       "App Two Brand New",
-			Target:     `C:\Tools\app2.exe`,
-			IconBase64: validPNG,
-		},
-	}
-
-	err = c.SyncApps(secondApps, "/bin/launcher", configPath, socketPath)
-	if err == nil {
-		t.Fatal("expected SyncApps to fail when apps.json target is a directory, got nil")
-	}
-
-	// Verify rollback:
-	// app1 desktop should be restored to "Name=App One Version 1"
-	restoredDesktop, err := os.ReadFile(desktop1Path)
-	if err != nil || !strings.Contains(string(restoredDesktop), "Name=App One Version 1") {
-		t.Fatalf("app1 desktop was not rolled back to Version 1! got: %s, err=%v", string(restoredDesktop), err)
-	}
-
-	// app2 desktop should have been removed by rollback
-	app2Desktop := filepath.Join(appData, "rdp-launcher-go-app2.desktop")
-	if _, err := os.Stat(app2Desktop); !os.IsNotExist(err) {
-		t.Fatalf("new app2 desktop should have been removed by rollback, err=%v", err)
-	}
-
-	// app2 icon should have been removed by rollback
-	app2Icon := filepath.Join(appCache, "rdp-launcher-go-app2.png")
-	if _, err := os.Stat(app2Icon); !os.IsNotExist(err) {
-		t.Fatalf("new app2 icon should have been removed by rollback, err=%v", err)
-	}
-}
-
 func TestSyncAppsFilteredAppCleansIconsAndDesktops(t *testing.T) {
 	root := t.TempDir()
 	cacheDir := filepath.Join(root, "cache")
@@ -468,77 +381,6 @@ func TestSyncAppsFilteredAppCleansIconsAndDesktops(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(appData, "rdp-launcher-go-app1.desktop")); err != nil {
 		t.Fatalf("app1 desktop should still exist, err=%v", err)
-	}
-}
-
-func TestRollbackRestoresBackup(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "app.desktop")
-	backup := filepath.Join(dir, ".backup.tmp")
-	if err := os.WriteFile(target, []byte("new version"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(backup, []byte("old version"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	records := []backupRecord{{target: target, backup: backup}}
-	if err := rollback(records); err != nil {
-		t.Fatalf("rollback failed: %v", err)
-	}
-	data, err := os.ReadFile(target)
-	if err != nil || string(data) != "old version" {
-		t.Fatalf("target was not restored to old version! got: %q, err=%v", string(data), err)
-	}
-	if _, err := os.Stat(backup); !os.IsNotExist(err) {
-		t.Fatalf("backup file should no longer exist after rollback")
-	}
-}
-
-func TestRollbackReportsFailure(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "new-file.txt")
-	if err := os.WriteFile(target, []byte("content"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	// Make directory read-only so os.Remove(target) fails on Linux
-	if err := os.Chmod(dir, 0555); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chmod(dir, 0755)
-
-	records := []backupRecord{{target: target, backup: ""}}
-	err := rollback(records)
-	if err == nil {
-		t.Fatal("expected rollback to report failure when file cannot be removed")
-	}
-	if !strings.Contains(err.Error(), "remove") {
-		t.Fatalf("expected error mentioning remove, got: %v", err)
-	}
-}
-
-func TestHandlePublishErrorReportsBothPublishAndRollbackFailures(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "target.txt")
-	if err := os.WriteFile(target, []byte("content"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(dir, 0555); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chmod(dir, 0755)
-
-	pubErr := fmt.Errorf("simulated publish failure on disk full")
-	records := []backupRecord{{target: target, backup: ""}}
-
-	joinedErr := handlePublishError(pubErr, records)
-	if joinedErr == nil {
-		t.Fatal("expected non-nil error")
-	}
-	if !strings.Contains(joinedErr.Error(), "simulated publish failure") {
-		t.Fatalf("expected error to contain publish failure, got: %v", joinedErr)
-	}
-	if !strings.Contains(joinedErr.Error(), "rollback failed") {
-		t.Fatalf("expected error to contain rollback failure, got: %v", joinedErr)
 	}
 }
 

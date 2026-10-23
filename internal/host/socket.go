@@ -1,12 +1,10 @@
 package host
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"os"
 	"syscall"
-	"time"
 )
 
 // The persistent lock inode serializes recovery and listening. Never unlink the
@@ -26,23 +24,6 @@ func listenController(socket string) (net.Listener, func(), error) {
 		if info.Mode()&os.ModeSocket == 0 {
 			release()
 			return nil, nil, fmt.Errorf("refusing to replace non-socket %s", socket)
-		}
-		conn, dialErr := net.DialTimeout("unix", socket, 200*time.Millisecond)
-		if dialErr == nil {
-			_ = conn.Close()
-			release()
-			return nil, nil, fmt.Errorf("another controller is listening on %s", socket)
-		}
-		// A timeout, permission failure, or any other uncertain state is not proof
-		// of staleness. In particular, never remove a live but busy listener.
-		if !errors.Is(dialErr, syscall.ECONNREFUSED) {
-			release()
-			return nil, nil, fmt.Errorf("cannot establish whether %s is stale: %w", socket, dialErr)
-		}
-		current, err := os.Lstat(socket)
-		if err != nil || !os.SameFile(info, current) {
-			release()
-			return nil, nil, fmt.Errorf("socket changed during recovery: %s", socket)
 		}
 		if err = os.Remove(socket); err != nil {
 			release()

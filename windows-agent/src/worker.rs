@@ -28,10 +28,7 @@ use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-use crate::protocol::{
-    take_frame, SessionRef, Ui, WorkerEnvelope, WorkerExpectedIdentity, WorkerRequest,
-    WorkerResponse, MAX_WORKER_FRAME_BYTES,
-};
+use crate::protocol::{take_frame, Ui, WorkerRequest, WorkerResponse, MAX_WORKER_FRAME_BYTES};
 
 const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKER_EXIT_GRACE: Duration = Duration::from_secs(1);
@@ -363,28 +360,14 @@ fn finish_process(process: &Handle) {
 }
 
 /// Run one fixed user action in an already verified session and return the
-/// worker's response. Every stage is bounded by `timeout`.
+/// worker's response. The SYSTEM backend verifies the session reference before
+/// spawning this worker under the user's token, and the pipe admits only SYSTEM
+/// and that account, so no identity is repeated in the frame. Every stage is
+/// bounded by `timeout`.
 pub fn execute(
     session_id: u32,
     configured_sid: &str,
-    reference: &SessionRef,
     request: WorkerRequest,
-    timeout: Duration,
-) -> io::Result<WorkerResponse> {
-    let envelope = WorkerEnvelope {
-        expected: Some(WorkerExpectedIdentity {
-            reference: reference.clone(),
-            sid: configured_sid.to_string(),
-        }),
-        request,
-    };
-    execute_envelope(session_id, configured_sid, &envelope, timeout)
-}
-
-fn execute_envelope(
-    session_id: u32,
-    configured_sid: &str,
-    envelope: &WorkerEnvelope,
     timeout: Duration,
 ) -> io::Result<WorkerResponse> {
     let deadline = Instant::now() + timeout;
@@ -399,7 +382,7 @@ fn execute_envelope(
         // after it returned, do not submit the business frame at all.
         remaining(deadline)?;
         connect_server(&pipe, &event, deadline)?;
-        let mut frame = serde_json::to_vec(envelope).map_err(io::Error::other)?;
+        let mut frame = serde_json::to_vec(&request).map_err(io::Error::other)?;
         frame.push(b'\n');
         write_all(&pipe, &event, &frame, deadline)?;
         let response = read_frame(&pipe, &event, deadline, MAX_WORKER_FRAME_BYTES)?;
@@ -412,11 +395,12 @@ fn execute_envelope(
 }
 
 pub fn observe_ui(session_id: u32, configured_sid: &str, timeout: Duration) -> io::Result<Ui> {
-    let envelope = WorkerEnvelope {
-        expected: None,
-        request: WorkerRequest::ObserveUi,
-    };
-    let response = execute_envelope(session_id, configured_sid, &envelope, timeout)?;
+    let response = execute(
+        session_id,
+        configured_sid,
+        WorkerRequest::ObserveUi,
+        timeout,
+    )?;
     if response.status != "ok" {
         return Err(io::Error::other(
             response
@@ -532,21 +516,6 @@ fn write_client_all(pipe: &Handle, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_worker_request(
-    expected: Option<&WorkerExpectedIdentity>,
-    request: &WorkerRequest,
-) -> Result<(), String> {
-    if matches!(request, WorkerRequest::ObserveUi) {
-        // Internal UI observation is display-only; it never authorizes an
-        // action and is allowed to omit the expected logon identity.
-        return Ok(());
-    }
-    let expected = expected
-        .ok_or_else(|| "user worker action requires expected SessionRef and SID".to_string())?;
-    crate::session::verify_worker_expected(expected)
-        .map_err(|error| format!("user worker identity check failed: {error}"))
-}
-
 fn execute_in_worker(request: WorkerRequest) -> WorkerResponse {
     match request {
         WorkerRequest::Run {
@@ -598,14 +567,11 @@ pub fn run_client(name: &str) -> io::Result<()> {
     let deadline = Instant::now() + WORKER_CONNECT_TIMEOUT;
     let pipe = connect_client(name, deadline)?;
     let frame = read_client_frame(&pipe, deadline)?;
-    let envelope: WorkerEnvelope = serde_json::from_slice(&frame).map_err(io::Error::other)?;
+    let request: WorkerRequest = serde_json::from_slice(&frame).map_err(io::Error::other)?;
 
     let com_initialized =
         unsafe { CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32) } >= 0;
-    let response = match validate_worker_request(envelope.expected.as_ref(), &envelope.request) {
-        Ok(()) => execute_in_worker(envelope.request),
-        Err(error) => WorkerResponse::error(error),
-    };
+    let response = execute_in_worker(request);
     if com_initialized {
         unsafe {
             CoUninitialize();
@@ -633,18 +599,6 @@ mod tests {
         assert!(second.starts_with(r"\\.\pipe\rdp-launcher-user-"));
         assert_ne!(first, second);
         assert!(!first.contains('\n'));
-    }
-
-    #[test]
-    fn business_worker_actions_require_expected_identity_but_ui_observation_does_not() {
-        let run = WorkerRequest::Run {
-            target: "notepad.exe".into(),
-            params: None,
-            working_dir: None,
-        };
-        let error = validate_worker_request(None, &run).expect_err("unbound business action");
-        assert!(error.contains("requires expected SessionRef"), "{error}");
-        assert!(validate_worker_request(None, &WorkerRequest::ObserveUi).is_ok());
     }
 
     #[test]

@@ -83,7 +83,7 @@ SID 另行限定配置账号。Session ID 可能复用，用户名也可能在�
 
 控制器不通过日志解析、进程名或“只有一个 Active”猜测归属。断开后 WTS 客户端字段可能清空，所以控制器保留已确认绑定，不从清空字段重建。
 
-Windows 后台在派发前重新核对完整引用。worker 再用自身进程 Session ID、SID、AuthenticationId 和 BootIdentifier 核对预期身份。应用枚举、盘符和 ShellExecute 均在该用户上下文执行，不回退到 SYSTEM。
+Windows 后台在派发前校验完整 `SessionRef` 与配置的 `SID`，随后以目标登录的 WTS 用户 token 在受限本机命名管道上启动 `user-worker`。`session_status` 返回 worker 的实际 `SessionRef` 与 `SID` 以确认连接绑定，worker 内部不再进行冗余的逐请求身份复核。应用枚举、盘符和 ShellExecute 均在该用户上下文执行，不回退到 SYSTEM。
 
 ## 消息源与恢复
 

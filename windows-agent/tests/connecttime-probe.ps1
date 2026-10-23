@@ -1,5 +1,5 @@
 # Passive, SYSTEM-only, x64 Windows WTS collector. No commands or state-changing APIs.
-# Load functions only: . .\probe.ps1 -LoadOnly
+# Load functions only: . .\connecttime-probe.ps1 -LoadOnly
 # Then: [LSW.ConnectTimeProbe.Native]::Snapshot() / ::Boot()
 [CmdletBinding()]
 param(

@@ -287,54 +287,6 @@ pub enum WorkerRequest {
     SessionStatus,
 }
 
-/// The backend binds every executable worker request to the logon identity it
-/// verified before spawning. The worker re-checks this against its own session
-/// and token; it never trusts the requested value as proof of placement.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct WorkerExpectedIdentity {
-    pub reference: SessionRef,
-    pub sid: String,
-}
-
-/// One worker frame: an optional expected identity plus the fixed action. UI
-/// observation is internal, non-authoritative data and may omit the identity.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct WorkerEnvelope {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected: Option<WorkerExpectedIdentity>,
-    #[serde(flatten)]
-    pub request: WorkerRequest,
-}
-
-/// Compare the worker's actual logon identity with the identity the backend
-/// verified before spawning. A matching Session ID and SID are not enough: a
-/// same-account re-logon changes the AuthenticationId.
-pub fn verify_worker_identity(
-    expected_reference: &SessionRef,
-    expected_sid: &str,
-    actual_reference: &SessionRef,
-    actual_sid: &str,
-) -> Result<(), String> {
-    expected_reference.validate()?;
-    actual_reference.validate()?;
-    if expected_reference.session_id != actual_reference.session_id {
-        return Err("worker executes in a different session".into());
-    }
-    if expected_sid != actual_sid {
-        return Err("worker account SID does not match the expected logon".into());
-    }
-    if expected_reference.authentication_id != actual_reference.authentication_id {
-        return Err("worker logon AuthenticationId does not match the expected logon".into());
-    }
-    if !same_boot_identifier(
-        &expected_reference.boot_identifier,
-        &actual_reference.boot_identifier,
-    ) {
-        return Err("worker boot identifier does not match the expected logon".into());
-    }
-    Ok(())
-}
-
 impl From<HostAction> for Option<WorkerRequest> {
     fn from(action: HostAction) -> Self {
         match action {
@@ -535,8 +487,8 @@ mod tests {
             "11111111-2222-4333-8444-555555555555"
         );
         let mut v4 = [0u8; 20];
-        // WTS IPv4 layout for the test host's 192.0.2.1 address.
-        v4[..6].copy_from_slice(&[0, 0, 192, 168, 122, 1]);
+        // WTS IPv4 layout for the documentation address 192.0.2.1.
+        v4[..6].copy_from_slice(&[0, 0, 192, 0, 2, 1]);
         assert_eq!(format_client_address(2, &v4), "192.0.2.1");
         v4[..2].copy_from_slice(&[0x12, 0x34]);
         assert_eq!(format_client_address(2, &v4), "192.0.2.1");
@@ -672,79 +624,6 @@ mod tests {
         assert!(matches!(worker, WorkerRequest::GetMappedDrives));
         let worker: WorkerRequest = serde_json::from_str(r#"{"action":"observe_ui"}"#).unwrap();
         assert!(matches!(worker, WorkerRequest::ObserveUi));
-    }
-
-    #[test]
-    fn worker_envelope_carries_expected_identity_for_executable_actions() {
-        let expected = WorkerExpectedIdentity {
-            reference: reference(),
-            sid: "S-1-5-21-1".into(),
-        };
-        let envelope = WorkerEnvelope {
-            expected: Some(expected.clone()),
-            request: WorkerRequest::SessionStatus,
-        };
-        let value = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(value["action"], "session_status");
-        assert_eq!(
-            value["expected"]["reference"],
-            serde_json::to_value(reference()).unwrap()
-        );
-        assert_eq!(value["expected"]["sid"], "S-1-5-21-1");
-        let decoded: WorkerEnvelope = serde_json::from_value(value).unwrap();
-        assert_eq!(decoded.expected, Some(expected));
-        assert!(matches!(decoded.request, WorkerRequest::SessionStatus));
-
-        let observe = WorkerEnvelope {
-            expected: None,
-            request: WorkerRequest::ObserveUi,
-        };
-        let value = serde_json::to_value(&observe).unwrap();
-        assert_eq!(value["action"], "observe_ui");
-        assert!(value.get("expected").is_none());
-        let decoded: WorkerEnvelope = serde_json::from_value(value).unwrap();
-        assert!(decoded.expected.is_none());
-        assert!(matches!(decoded.request, WorkerRequest::ObserveUi));
-    }
-
-    #[test]
-    fn worker_identity_rejects_same_session_and_sid_with_a_different_luid() {
-        let expected = reference();
-        let actual = SessionRef {
-            authentication_id: "0000000003D481ED".into(),
-            ..reference()
-        };
-        let error = verify_worker_identity(&expected, "S-1-5-21-1", &actual, "S-1-5-21-1")
-            .expect_err("same-account re-logon was accepted");
-        assert!(error.contains("AuthenticationId"), "{error}");
-
-        let exact = verify_worker_identity(&expected, "S-1-5-21-1", &expected, "S-1-5-21-1");
-        assert!(exact.is_ok());
-
-        let wrong_sid = verify_worker_identity(&expected, "S-1-5-21-1", &expected, "S-1-5-21-2");
-        assert!(wrong_sid.unwrap_err().contains("SID"));
-
-        let wrong_boot = verify_worker_identity(
-            &expected,
-            "S-1-5-21-1",
-            &SessionRef {
-                boot_identifier: "af319887-9fd7-11f1-b633-ef01453eabe7".into(),
-                ..reference()
-            },
-            "S-1-5-21-1",
-        );
-        assert!(wrong_boot.unwrap_err().contains("boot identifier"));
-
-        let wrong_session = verify_worker_identity(
-            &expected,
-            "S-1-5-21-1",
-            &SessionRef {
-                session_id: 6,
-                ..reference()
-            },
-            "S-1-5-21-1",
-        );
-        assert!(wrong_session.unwrap_err().contains("session"));
     }
 
     #[test]

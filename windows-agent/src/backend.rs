@@ -12,8 +12,8 @@ use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use crate::protocol::{
-    check_protocol, verify_worker_identity, ErrorResponse, HostAction, Snapshot, WorkerRequest,
-    WorkerResponse, PROTOCOL, ROLE_BACKGROUND, ROLE_USER,
+    check_protocol, ErrorResponse, HostAction, Snapshot, WorkerRequest, WorkerResponse, PROTOCOL,
+    ROLE_BACKGROUND, ROLE_USER,
 };
 use crate::{auth, memory, session, ssh, worker};
 
@@ -73,7 +73,7 @@ mod tests {
     }
 
     #[test]
-    fn session_status_response_proves_the_user_worker_identity() {
+    fn session_status_response_reports_the_user_worker_activity() {
         let reference = crate::protocol::SessionRef {
             session_id: 4,
             authentication_id: "0000000003C517EA".into(),
@@ -488,8 +488,6 @@ async fn handle(
                 .await;
             }
             let sid = access.sid.clone();
-            let response_sid = sid.clone();
-            let response_reference = session_ref.clone();
             let deadline = Instant::now() + USER_ACTION_WORKER_TIMEOUT;
             let result = tokio::task::spawn_blocking(move || {
                 session::verify_reference(&session_ref, &sid)?;
@@ -503,7 +501,6 @@ async fn handle(
                 worker::execute(
                     session_ref.session_id,
                     &sid,
-                    &session_ref,
                     WorkerRequest::SessionStatus,
                     remaining,
                 )
@@ -521,20 +518,6 @@ async fn handle(
                             .await
                         }
                     };
-                    if let Err(error) = verify_worker_identity(
-                        &response_reference,
-                        &response_sid,
-                        &status.reference,
-                        &status.sid,
-                    ) {
-                        return send_error(
-                            &mut write,
-                            ErrorResponse::protocol(format!(
-                                "user worker identity does not match the verified session_ref:                                  {error}"
-                            )),
-                        )
-                        .await;
-                    }
                     send(&mut write, &user_status_response(status)).await
                 }
                 Ok(Ok(response)) => {
@@ -617,13 +600,7 @@ async fn handle(
                         "user action expired after identity verification",
                     ));
                 }
-                worker::execute(
-                    reference.session_id,
-                    &sid,
-                    &reference,
-                    worker_request,
-                    remaining,
-                )
+                worker::execute(reference.session_id, &sid, worker_request, remaining)
             })
             .await;
             match result {

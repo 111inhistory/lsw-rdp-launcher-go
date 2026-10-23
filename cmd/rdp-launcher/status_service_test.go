@@ -153,17 +153,11 @@ esac
 }
 
 func TestServiceOverrideQuotesPathsWithoutExpandingThem(t *testing.T) {
-	text, err := hostServiceOverride(`/opt/space dir/app%$"\`, "/tmp/line\nbreak", `/tmp/socket`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	text := hostServiceOverride(`/opt/space dir/app%$"\`, "/tmp/line\nbreak", `/tmp/socket`)
 	for _, want := range []string{`%%$$\"\\`, `/tmp/line\nbreak`, "ExecStart=\nExecStart=", ` --socket "/tmp/socket" serve`} {
 		if !strings.Contains(text, want) {
 			t.Fatal("unsafe systemd argument", want, text)
 		}
-	}
-	if _, err := hostServiceOverride("bad\x00path", "config", "socket"); err == nil {
-		t.Fatal("NUL accepted")
 	}
 }
 

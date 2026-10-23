@@ -268,10 +268,6 @@ func CallWithConfirm(ctx context.Context, socket string, request Request, confir
 				_ = encoder.Encode(decision{Type: "decision", ID: response.ID, Decision: controller.SwitchCancel})
 				return nil, choiceErr
 			}
-			if !response.Prompt.Allows(value) {
-				_ = encoder.Encode(decision{Type: "decision", ID: response.ID, Decision: controller.SwitchCancel})
-				return nil, fmt.Errorf("choice %q is not allowed for this task", value)
-			}
 			if err = encoder.Encode(decision{Type: "decision", ID: response.ID, Decision: value}); err != nil {
 				return nil, err
 			}

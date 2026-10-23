@@ -59,10 +59,7 @@ func startHost(ctx context.Context, config, socket string, out io.Writer) error 
 	if err != nil {
 		return err
 	}
-	override, err := hostServiceOverride(executable, config, socket)
-	if err != nil {
-		return err
-	}
+	override := hostServiceOverride(executable, config, socket)
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return err
@@ -135,14 +132,9 @@ func startHost(ctx context.Context, config, socket string, out io.Writer) error 
 	}
 }
 
-func hostServiceOverride(executable, config, socket string) (string, error) {
+func hostServiceOverride(executable, config, socket string) string {
 	quote := func(value string) string {
 		return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "%", "%%", "$", "$$", "\n", `\n`, "\r", `\r`, "\t", `\t`).Replace(value) + `"`
 	}
-	for _, value := range []string{executable, config, socket} {
-		if strings.IndexByte(value, 0) >= 0 {
-			return "", fmt.Errorf("service paths must not contain NUL")
-		}
-	}
-	return "# Managed by rdp-launcher start. Other service settings are preserved.\n[Service]\nExecStart=\nExecStart=" + quote(executable) + " --config " + quote(config) + " --socket " + quote(socket) + " serve\n", nil
+	return "# Managed by rdp-launcher start. Other service settings are preserved.\n[Service]\nExecStart=\nExecStart=" + quote(executable) + " --config " + quote(config) + " --socket " + quote(socket) + " serve\n"
 }

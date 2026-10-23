@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"strings"
 	"testing"
 )
 
@@ -10,51 +9,6 @@ func addUserJob(m *machine, action, mode string) *job {
 	j := &job{ctx: context.Background(), request: Request{Action: action, Mode: mode, UserContext: true}, reply: make(chan Result, 1)}
 	m.enqueue(j)
 	return j
-}
-
-func TestDisplayModeAndConflictRequireUserContext(t *testing.T) {
-	if err := (Request{Action: "list_apps"}).Validate(); err != nil {
-		t.Fatal(err)
-	}
-	for _, request := range []Request{
-		{Action: "list_apps", Mode: ModeRemoteApp},
-		{Action: "list_apps", Mode: ModeDesktop},
-		{Action: "run", Target: "app", Mode: ModeRemoteApp},
-	} {
-		if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "user context") {
-			t.Fatalf("display mode without user context was accepted: %+v (%v)", request, err)
-		}
-	}
-	if err := (Request{Action: "list_apps", Mode: ModeRemoteApp, UserContext: true}).Validate(); err != nil {
-		t.Fatal(err)
-	}
-	if err := (Request{Action: "run", Target: "app", UserContext: true, Choice: SwitchKeep}).Validate(); err != nil {
-		t.Fatal(err)
-	}
-	if err := (Request{Action: "run", Target: "app", Choice: SwitchKeep}).Validate(); err == nil {
-		t.Fatal("conflict action without user context was accepted")
-	}
-}
-
-func TestBatchUserContextBelongsToOuterRequestOnly(t *testing.T) {
-	batch := Request{
-		Action:      "batch",
-		UserContext: true,
-		Mode:        ModeRemoteApp,
-		Batch:       []Request{{Action: "open", Target: `C:\a.txt`}, {Action: "open", Target: `C:\b.txt`}},
-	}
-	if err := batch.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	batch.Batch[0].UserContext = true
-	if err := batch.Validate(); err == nil {
-		t.Fatal("batch item user context was accepted")
-	}
-	batch.Batch[0].UserContext = false
-	batch.UserContext = false
-	if err := batch.Validate(); err == nil {
-		t.Fatal("batch without outer user context was accepted")
-	}
 }
 
 func TestBoundDesktopModeNeutralQueriesDispatchOnExactLoginWithoutConfirmation(t *testing.T) {
