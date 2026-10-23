@@ -3,7 +3,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -490,13 +490,9 @@ async fn handle(
             let sid = access.sid.clone();
             let response_sid = sid.clone();
             let response_reference = session_ref.clone();
+            let deadline = Instant::now() + USER_ACTION_WORKER_TIMEOUT;
             let result = tokio::task::spawn_blocking(move || {
-                worker::execute(
-                    &session_ref,
-                    &sid,
-                    WorkerRequest::SessionStatus,
-                    USER_ACTION_WORKER_TIMEOUT,
-                )
+                worker::execute(&session_ref, &sid, WorkerRequest::SessionStatus, deadline)
             })
             .await;
             match result {
@@ -599,8 +595,9 @@ async fn handle(
                 .await;
             };
             let sid = access.sid.clone();
+            let deadline = Instant::now() + timeout;
             let result = tokio::task::spawn_blocking(move || {
-                worker::execute(&reference, &sid, worker_request, timeout)
+                worker::execute(&reference, &sid, worker_request, deadline)
             })
             .await;
             match result {

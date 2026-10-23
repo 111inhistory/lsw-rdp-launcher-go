@@ -387,15 +387,14 @@ fn execute_with_token(
 
 /// Open and verify the target session's user token against reference and
 /// configured_sid, then spawn the user worker with that exact verified token
-/// handle and return its response. Every stage shares the single timeout
-/// deadline without resetting the budget.
+/// handle and return its response. The caller fixes deadline before queuing on
+/// the blocking pool so queue wait is deducted before any token or process work.
 pub fn execute(
     reference: &SessionRef,
     configured_sid: &str,
     request: WorkerRequest,
-    timeout: Duration,
+    deadline: Instant,
 ) -> io::Result<WorkerResponse> {
-    let deadline = Instant::now() + timeout;
     remaining(deadline)?;
     let token = crate::session::open_verified_user_token(reference, configured_sid)?;
     execute_with_token(token.as_raw(), configured_sid, request, deadline)
@@ -411,12 +410,7 @@ pub fn observe_ui(session_id: u32, configured_sid: &str, timeout: Duration) -> i
         }
         Handle(raw_token)
     };
-    let response = execute_with_token(
-        token.0,
-        configured_sid,
-        WorkerRequest::ObserveUi,
-        deadline,
-    )?;
+    let response = execute_with_token(token.0, configured_sid, WorkerRequest::ObserveUi, deadline)?;
     if response.status != "ok" {
         return Err(io::Error::other(
             response
@@ -615,6 +609,55 @@ mod tests {
         assert!(second.starts_with(r"\\.\pipe\rdp-launcher-user-"));
         assert_ne!(first, second);
         assert!(!first.contains('\n'));
+    }
+
+    #[test]
+    fn pre_queued_deadline_expiration_aborts_before_token_or_worker_execution() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        let (occupied_tx, occupied_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            occupied_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        occupied_rx.recv().unwrap();
+
+        // Fix the deadline before submitting to the saturated blocking pool,
+        // matching backend.rs. If execute entered open_verified_user_token,
+        // this invalid session_id=0 reference would fail with a validation
+        // error instead of TimedOut.
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let invalid_ref = SessionRef {
+            session_id: 0,
+            authentication_id: String::new(),
+            boot_identifier: String::new(),
+        };
+        let queued = runtime.spawn_blocking(move || {
+            execute(
+                &invalid_ref,
+                "S-1-5-21-1",
+                WorkerRequest::GetMappedDrives,
+                deadline,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(35));
+        release_tx.send(()).unwrap();
+
+        let error = runtime
+            .block_on(async {
+                blocker.await.unwrap();
+                queued.await.unwrap()
+            })
+            .expect_err("expired queued request must not execute");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::TimedOut,
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
