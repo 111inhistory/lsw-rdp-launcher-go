@@ -86,10 +86,10 @@ pub fn format_guid(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> String
 /// produce an empty display value rather than a guessed address.
 pub fn format_client_address(address_family: u32, address: &[u8; 20]) -> String {
     match address_family {
-        // AF_INET
+        // AF_INET: WTS stores the IPv4 octets at Address[2..6], not [0..4].
         2 => format!(
             "{}.{}.{}.{}",
-            address[0], address[1], address[2], address[3]
+            address[2], address[3], address[4], address[5]
         ),
         // AF_INET6
         23 => {
@@ -535,8 +535,11 @@ mod tests {
             "11111111-2222-4333-8444-555555555555"
         );
         let mut v4 = [0u8; 20];
-        v4[..4].copy_from_slice(&[192, 0, 2, 10]);
-        assert_eq!(format_client_address(2, &v4), "192.0.2.10");
+        // WTS IPv4 layout for the test host's 192.0.2.1 address.
+        v4[..6].copy_from_slice(&[0, 0, 192, 168, 122, 1]);
+        assert_eq!(format_client_address(2, &v4), "192.0.2.1");
+        v4[..2].copy_from_slice(&[0x12, 0x34]);
+        assert_eq!(format_client_address(2, &v4), "192.0.2.1");
         assert_eq!(format_client_address(0, &v4), "");
         let mut v6 = [0u8; 20];
         v6[..16].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
