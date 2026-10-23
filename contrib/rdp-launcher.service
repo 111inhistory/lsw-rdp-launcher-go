@@ -1,7 +1,7 @@
 [Unit]
 Description=RDP Launcher Go controller
 PartOf=graphical-session.target
-After=graphical-session-pre.target
+After=graphical-session-pre.target niri.service
 
 [Service]
 Type=simple
