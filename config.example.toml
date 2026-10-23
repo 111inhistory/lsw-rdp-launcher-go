@@ -4,6 +4,7 @@ host = "192.0.2.10" # Explicit guest IP; no address discovery.
 user = "Administrator"
 service = "rdp-bridge" # Keyring service for the RDP password (username = user).
 agent_service = "rdp-bridge-agent" # Separate keyring service; username is always "agent".
+
 # Windows-side path of the shared token file. The Windows background service
 # (Session 0) must be given this file via --auth-token-file. The file ACL must
 # allow SYSTEM and the configured interactive Windows user; Administrators may
