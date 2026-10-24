@@ -45,7 +45,14 @@ func (c Config) ListApps() ([]adapter.App, error) {
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	return c.Catalog(apps), nil
+	catalog := c.Catalog(apps)
+	for i := range catalog {
+		if catalog[i].IconBase64 != "" {
+			catalog[i].Icon = filepath.Join(cacheDir(), "rdp-launcher-go-"+url.PathEscape(catalog[i].ID)+".png")
+			catalog[i].IconBase64 = ""
+		}
+	}
+	return catalog, nil
 }
 
 func (c Config) ResolveApp(target string) adapter.App {

@@ -117,7 +117,7 @@ SSH 非零或未知、后台失效、lock 和新请求会中止空闲计划。�
 - `[[apps]]` 可添加未被扫描到的应用。`id`、`name`、`target` 必填；可设置 `arguments`、`working_dir`、`icon`。无需先同步即可运行。
 - `[filters]` 按 ID、名称、目标或快捷方式路径精确排除应用；目录规则使用 Windows 路径并包含子目录。过滤不是执行权限限制。
 - `[[overrides]]` 设置 MIME 和分类，不会恢复已排除的应用。
-- `list-apps` 合并本地缓存与手动配置；相同 ID 以手动配置为准。
+- `list-apps` 合并本地缓存与手动配置；相同 ID 以手动配置为准。图标以 `icon` 输出本地缓存 PNG 路径或原有配置值，不输出 `icon_base64`，也不检查或重建图标文件。
 - `sync-apps` 只维护自身 `rdp-launcher-go-` 命名空间的入口和图标，不删除其他应用的文件。
 
 缓存位于 `$XDG_CACHE_HOME/rdp-launcher-go`，桌面入口位于 `$XDG_DATA_HOME/applications`。未设置 XDG 变量时使用用户目录默认值。`install-shortcuts` 不连接 VM，也会重建缓存应用入口。

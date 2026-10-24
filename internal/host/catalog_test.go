@@ -1,15 +1,65 @@
 package host
 
 import (
+	"encoding/json"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/111inhistory/lsw-rdp-launcher-go/internal/adapter"
 )
+
+func TestListAppsUsesIconPathsWithoutChangingSources(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", root)
+	if err := os.MkdirAll(cacheDir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	discovered := []adapter.App{
+		{ID: "editor/with space%", IconBase64: "base64-data", Icon: "ignored-theme"},
+		{ID: "theme", Icon: "accessories-text-editor"},
+		{ID: "file", Icon: "/opt/icons/app.png"},
+		{ID: "none"},
+	}
+	data, err := json.Marshal(discovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachePath := filepath.Join(cacheDir(), "apps.json")
+	if err := os.WriteFile(cachePath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := Config{Apps: []adapter.App{{ID: "manual", IconBase64: "manual-base64"}}}
+	apps, err := c.ListApps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]adapter.App{{ID: "manual", Icon: filepath.Join(cacheDir(), "rdp-launcher-go-manual.png")}}, discovered...)
+	want[1].IconBase64 = ""
+	want[1].Icon = filepath.Join(cacheDir(), "rdp-launcher-go-editor%2Fwith%20space%25.png")
+	if !reflect.DeepEqual(apps, want) {
+		t.Fatalf("apps = %+v, want %+v", apps, want)
+	}
+	output, err := json.Marshal(apps)
+	if err != nil || strings.Contains(string(output), "icon_base64") {
+		t.Fatalf("output = %s, err = %v", output, err)
+	}
+	if c.Apps[0].IconBase64 != "manual-base64" {
+		t.Fatal("listing changed configured icon data")
+	}
+	cached, err := os.ReadFile(cachePath)
+	if err != nil || string(cached) != string(data) {
+		t.Fatal("listing changed cached icon data", err)
+	}
+	entries, err := os.ReadDir(cacheDir())
+	if err != nil || len(entries) != 1 {
+		t.Fatal("listing should not create icon files", entries, err)
+	}
+}
 
 func TestDesktopKeyFileSerialization(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "special.desktop")
